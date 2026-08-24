@@ -21,7 +21,12 @@ func finish(json: Bool, result: OperationResult) -> Never {
 }
 
 /// Convert a thrown SecureTokenError into a JSON line (optional) + exit code.
-func fail(json: Bool, action: String, user: String, method: TokenMethod, _ error: Error) -> Never {
+///
+/// `generatedPassword` must be passed whenever the tool actually applied a
+/// generated password to a real account: dropping it on a failure path would
+/// leave an account nobody holds the credential for.
+func fail(json: Bool, action: String, user: String, method: TokenMethod, _ error: Error,
+          generatedPassword: String? = nil) -> Never {
     let message: String
     let code: Int32
     if let e = error as? SecureTokenError {
@@ -33,7 +38,7 @@ func fail(json: Bool, action: String, user: String, method: TokenMethod, _ error
     if json {
         let r = OperationResult(status: "error", exitCode: code, action: action,
                                 user: user, tokenMethod: method.rawValue, message: message,
-                                generatedPassword: nil)
+                                generatedPassword: generatedPassword)
         print(r.jsonLine(version: SecureTokenManager.version))
     }
     exit(code)
@@ -74,20 +79,25 @@ struct CommonOptions: ParsableArguments {
     @Flag(name: .long, help: "Emit a JSON result line on stdout (or ST_JSON=1).")
     var json = false
 
-    @Flag(name: .long, help: "Pass passwords inline instead of via stdin (ST_STDIN_SECRETS=0).")
-    var inlineSecrets = false
+    @Option(name: .long, help: "Secret delivery: inline (default) or stdin (ST_SECRET_MODE). '-'/stdin is an interactive prompt and needs a TTY.")
+    var secretMode: String?
 
-    @Flag(name: .long, help: "Do not use the Bootstrap Token (ST_PREFER_BOOTSTRAP=0).")
+    @Flag(name: .long, help: "Do not fall back to a deferred first-login Bootstrap Token grant (ST_PREFER_BOOTSTRAP=0).")
     var noBootstrap = false
+
+    @Flag(name: .long, help: "Treat a deferred (first-login) grant as a failure (ST_REQUIRE_IMMEDIATE_TOKEN=1).")
+    var requireImmediate = false
 
     @Option(name: .long, help: "Log file path (default /var/log/securetoken.log or ST_LOG_FILE).")
     var logFile: String?
 
     var jsonEnabled: Bool { json || envFlag("ST_JSON") }
+    var requireImmediateToken: Bool { requireImmediate || envFlag("ST_REQUIRE_IMMEDIATE_TOKEN") }
 
     func makeManager() -> SecureTokenManager {
         let mgr = SecureTokenManager(logFile: logFile ?? env("ST_LOG_FILE") ?? "/var/log/securetoken.log")
-        mgr.stdinSecrets = !(inlineSecrets || (env("ST_STDIN_SECRETS").map { $0 == "0" } ?? false))
+        let mode = (secretMode ?? env("ST_SECRET_MODE") ?? "inline").lowercased()
+        mgr.stdinSecrets = (mode == "stdin")
         mgr.preferBootstrap = !(noBootstrap || (env("ST_PREFER_BOOTSTRAP").map { $0 == "0" } ?? false))
         return mgr
     }
@@ -114,14 +124,28 @@ struct Preflight: ParsableCommand {
         mgr.info("bootstrap tok : \(bt ? "yes" : "no")")
         mgr.info("token holders : \(mgr.tokenHolders().joined(separator: ", "))")
 
-        let ready = mgr.isRoot() && mgr.supportsSecureToken()
-        let msg = bt ? "READY (credential-free via Bootstrap Token)"
-                     : "needs a Secure Token admin (ST_ADMIN_USER/ST_ADMIN_PASSWORD)"
+        // Readiness reflects how a token could actually be obtained. sysadminctl
+        // cannot spend a Bootstrap Token, so "escrowed" alone is not readiness:
+        // it only enables a deferred grant at the user's first login.
+        let haveAdmin = (env("ST_ADMIN_USER") != nil) && (env("ST_ADMIN_PASSWORD") != nil)
+        let loginGrant = mgr.bootstrapLoginGrantAvailable()
+        let readinessMsg: String
+        var ready = mgr.isRoot() && mgr.supportsSecureToken()
+        if haveAdmin {
+            readinessMsg = "admin credentials supplied — immediate grant possible"
+        } else if loginGrant {
+            readinessMsg = "no admin credentials — token will be granted at first login (Bootstrap Token)"
+        } else {
+            readinessMsg = "NOT READY: supply ST_ADMIN_USER/ST_ADMIN_PASSWORD (a Secure Token holder), or enrol with an escrowed Bootstrap Token"
+            ready = false
+        }
+        mgr.info("readiness     : \(readinessMsg)")
         finish(json: json, result: OperationResult(
             status: ready ? "ok" : "error",
             exitCode: ready ? ExitStatus.ok.rawValue : ExitStatus.unsupported.rawValue,
-            action: "preflight", user: "", tokenMethod: bt ? "bootstrap" : "admin",
-            message: msg, generatedPassword: nil))
+            action: "preflight", user: "",
+            tokenMethod: haveAdmin ? "admin" : (loginGrant ? "deferred-login" : "none"),
+            message: readinessMsg, generatedPassword: nil))
     }
 }
 
@@ -150,6 +174,7 @@ struct CreateUser: ParsableCommand {
 
         let user = username ?? env("ST_NEW_USER") ?? ""
         var generated: String? = nil
+        var passwordApplied = false
         do {
             try mgr.validateUsername(user)
         } catch { fail(json: json, action: action, user: user, method: .none, error) }
@@ -185,15 +210,37 @@ struct CreateUser: ParsableCommand {
             if mgr.userExists(user) {
                 mgr.warn("User '\(user)' already exists; token grant uses the supplied password and fails if it does not match")
             }
+            // Fail fast: prove a token source is viable (including that the admin
+            // password authenticates) BEFORE creating anything, so a stale
+            // credential cannot leave an orphaned tokenless account behind.
+            let plan = try mgr.resolveTokenPlan(adminUser: au, adminPassword: ap)
+            if plan.0 == .deferredLogin && common.requireImmediateToken {
+                throw SecureTokenError(status: .tokenDeferred,
+                    message: "No admin credentials supplied: the Secure Token can only be granted at first login, but --require-immediate was set")
+            }
+
             try mgr.createUser(username: user, fullName: full, password: pw,
                                makeAdmin: admin, hidden: hide, uid: resolvedUID)
+            // The password is now applied to a real account: from here on it must
+            // be surfaced even on failure, or the account becomes unreachable.
+            passwordApplied = true
+
             let method = try mgr.ensureToken(user: user, password: pw, adminUser: au, adminPassword: ap)
+            if method == .deferredLogin {
+                mgr.info("SUCCESS: '\(user)' created. Secure Token will be granted at first login (Bootstrap Token).")
+                finish(json: json, result: OperationResult(status: "ok", exitCode: 0, action: action,
+                    user: user, tokenMethod: method.rawValue,
+                    message: "user created; secure token deferred to first login", generatedPassword: generated))
+            }
             mgr.info("SUCCESS: '\(user)' created and holds a Secure Token (method=\(method.rawValue))")
             finish(json: json, result: OperationResult(status: "ok", exitCode: 0, action: action,
                 user: user, tokenMethod: method.rawValue,
                 message: "user created and secure token granted", generatedPassword: generated))
         } catch {
-            fail(json: json, action: action, user: user, method: .none, error)
+            // Surface a generated password that was actually applied, so a later
+            // failure never leaves an account nobody can log into.
+            fail(json: json, action: action, user: user, method: .none, error,
+                 generatedPassword: passwordApplied ? generated : nil)
         }
     }
 }
@@ -227,6 +274,15 @@ struct GrantToken: ParsableCommand {
                 throw SecureTokenError.usage("Target user's password is required (set --password or ST_NEW_PASSWORD)")
             }
             let method = try mgr.ensureToken(user: user, password: pw, adminUser: au, adminPassword: ap)
+            if method == .deferredLogin {
+                if common.requireImmediateToken {
+                    throw SecureTokenError(status: .tokenDeferred,
+                        message: "Secure Token can only be granted at first login, but --require-immediate was set")
+                }
+                finish(json: json, result: OperationResult(status: "ok", exitCode: 0, action: action,
+                    user: user, tokenMethod: method.rawValue,
+                    message: "secure token will be granted at first login (Bootstrap Token)", generatedPassword: nil))
+            }
             finish(json: json, result: OperationResult(status: "ok", exitCode: 0, action: action,
                 user: user, tokenMethod: method.rawValue, message: "secure token ensured", generatedPassword: nil))
         } catch {
@@ -245,6 +301,9 @@ struct Status: ParsableCommand {
     func run() throws {
         let mgr = common.makeManager()
         let json = common.jsonEnabled
+        // status reads directory services and must not report a confidently
+        // wrong answer when run without privileges.
+        requireDarwinRootSupported(mgr, json: json, action: "status")
         let user = username ?? env("ST_NEW_USER") ?? ""
         do { try mgr.validateUsername(user) }
         catch { fail(json: json, action: "status", user: user, method: .none, error) }
@@ -269,6 +328,7 @@ struct ListTokens: ParsableCommand {
 
     func run() throws {
         let mgr = common.makeManager()
+        requireDarwinRootSupported(mgr, json: common.jsonEnabled, action: "list")
         let holders = mgr.tokenHolders()
         mgr.info("Users with a Secure Token:")
         if holders.isEmpty { mgr.info("  (none)") } else { holders.forEach { mgr.info("  - \($0)") } }
@@ -296,10 +356,17 @@ struct Interactive: ParsableCommand {
         let pw = securePrompt("Password: ")
         let admin = yesNo("Administrator? (y/n): ")
 
+        // sysadminctl cannot spend a Bootstrap Token, so admin credentials are
+        // what enable an immediate grant. Offer to skip them only when a
+        // deferred first-login grant is genuinely available.
         var au: String? = nil
         var ap: String? = nil
-        if !(mgr.bootstrapTokenEscrowed()) {
-            print("No Bootstrap Token — a Secure Token admin is required.")
+        let canDefer = mgr.bootstrapLoginGrantAvailable()
+        if canDefer {
+            print("A Bootstrap Token is escrowed: without admin credentials the Secure Token")
+            print("will be granted automatically at this user's FIRST LOGIN.")
+        }
+        if !canDefer || yesNo("Supply Secure Token admin credentials for an immediate grant? (y/n): ") {
             au = prompt("Admin username: ")
             ap = securePrompt("Admin password: ")
         }
@@ -307,9 +374,14 @@ struct Interactive: ParsableCommand {
         do {
             try mgr.validateUsername(user)
             try mgr.validatePassword(pw)
+            _ = try mgr.resolveTokenPlan(adminUser: au, adminPassword: ap)  // fail fast
             try mgr.createUser(username: user, fullName: full, password: pw, makeAdmin: admin, hidden: false, uid: nil)
             let method = try mgr.ensureToken(user: user, password: pw, adminUser: au, adminPassword: ap)
-            print("Done — '\(user)' holds a Secure Token (via \(method.rawValue)).")
+            if method == .deferredLogin {
+                print("Done — '\(user)' created. Its Secure Token will be granted at first login.")
+            } else {
+                print("Done — '\(user)' holds a Secure Token (via \(method.rawValue)).")
+            }
         } catch let e as SecureTokenError {
             FileHandle.standardError.write(("ERROR: " + e.message + "\n").data(using: .utf8) ?? Data())
             throw ExitCode(e.code)

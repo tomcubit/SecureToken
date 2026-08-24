@@ -67,6 +67,7 @@ final class SecureTokenTests: XCTestCase {
     // MARK: - Exit-code contract
 
     func testExitCodeContract() {
+        // Must stay in lockstep with scripts/securetoken.sh.
         XCTAssertEqual(ExitStatus.ok.rawValue, 0)
         XCTAssertEqual(ExitStatus.usage.rawValue, 2)
         XCTAssertEqual(ExitStatus.notRoot.rawValue, 10)
@@ -75,29 +76,46 @@ final class SecureTokenTests: XCTestCase {
         XCTAssertEqual(ExitStatus.createFailed.rawValue, 20)
         XCTAssertEqual(ExitStatus.grantFailed.rawValue, 21)
         XCTAssertEqual(ExitStatus.noTokenSource.rawValue, 22)
+        XCTAssertEqual(ExitStatus.tokenDeferred.rawValue, 23)
         XCTAssertEqual(ExitStatus.verifyFailed.rawValue, 40)
+    }
+
+    /// The tokenMethod strings are a documented part of the JSON contract.
+    func testTokenMethodRawValues() {
+        XCTAssertEqual(TokenMethod.admin.rawValue, "admin")
+        XCTAssertEqual(TokenMethod.deferredLogin.rawValue, "deferred-login")
+        XCTAssertEqual(TokenMethod.existing.rawValue, "existing")
+        XCTAssertEqual(TokenMethod.none.rawValue, "none")
     }
 
     // MARK: - JSON result serialisation
 
     func testJSONResultShape() {
         let r = OperationResult(status: "ok", exitCode: 0, action: "create-user",
-                                user: "itadmin", tokenMethod: "bootstrap",
+                                user: "itadmin", tokenMethod: TokenMethod.admin.rawValue,
                                 message: "done", generatedPassword: nil)
-        let line = r.jsonLine(version: "2.0.0")
+        let line = r.jsonLine(version: SecureTokenManager.version)
         XCTAssertTrue(line.contains("\"tool\":\"securetoken\""))
         XCTAssertTrue(line.contains("\"status\":\"ok\""))
         XCTAssertTrue(line.contains("\"exitCode\":0"))
         XCTAssertTrue(line.contains("\"user\":\"itadmin\""))
-        XCTAssertTrue(line.contains("\"tokenMethod\":\"bootstrap\""))
+        XCTAssertTrue(line.contains("\"tokenMethod\":\"admin\""))
         XCTAssertFalse(line.contains("generatedPassword"), "should omit when nil")
+    }
+
+    func testJSONResultDeferredMethod() {
+        let r = OperationResult(status: "ok", exitCode: 0, action: "create-user",
+                                user: "itadmin", tokenMethod: TokenMethod.deferredLogin.rawValue,
+                                message: "deferred", generatedPassword: nil)
+        XCTAssertTrue(r.jsonLine(version: SecureTokenManager.version)
+                        .contains("\"tokenMethod\":\"deferred-login\""))
     }
 
     func testJSONResultEscaping() {
         let r = OperationResult(status: "error", exitCode: 20, action: "create-user",
                                 user: "he\"quote", tokenMethod: "none",
                                 message: "line1\nline2\ttab", generatedPassword: "p\\w")
-        let line = r.jsonLine(version: "2.0.0")
+        let line = r.jsonLine(version: SecureTokenManager.version)
         XCTAssertTrue(line.contains("he\\\"quote"))
         XCTAssertTrue(line.contains("line1\\nline2\\ttab"))
         XCTAssertTrue(line.contains("\"generatedPassword\":\"p\\\\w\""))

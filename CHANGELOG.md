@@ -1,5 +1,67 @@
 # Changelog
 
+## 3.0.0 — Corrected Secure Token architecture
+
+### Fixed (critical)
+- **The "credential-free Bootstrap Token grant" in v2 does not exist.** Apple's
+  [Platform Deployment guide](https://support.apple.com/guide/deployment/use-secure-and-bootstrap-tokens-dep24dbdcf9e/web)
+  states that changing secure token status with `sysadminctl` *always* requires
+  an existing secure token administrator's credentials, and that an escrowed
+  Bootstrap Token instead causes macOS to grant the token **at the user's first
+  login** (macOS 11+). v2 believed `sysadminctl` could spend the Bootstrap Token
+  and *preferred* that path — so on exactly the MDM-enrolled fleet this tool
+  targets, it ignored valid admin credentials and left every device with a
+  tokenless account. That path has been removed.
+- The tool now implements the two real mechanisms: plan **`admin`** (credentials
+  supplied → immediate, verified grant) and plan **`deferred`** (no credentials +
+  escrowed Bootstrap Token → account created, token granted at first login,
+  reported as `tokenMethod: "deferred-login"`; exit 0, or 23 with
+  `ST_REQUIRE_IMMEDIATE_TOKEN=1`).
+- **Secret delivery default changed to `inline`.** `-password -` is Apple's
+  *interactive prompt* option and reads the controlling terminal, so it cannot be
+  fed by a pipe in a headless Intune/RMM session. `stdin` is now opt-in, and every
+  `sysadminctl` call runs under a watchdog so a prompt can never hang a job.
+- **Removed top-level `readonly`**, which is fatal on the bash 3.2 shipped with
+  macOS when the file is re-sourced — it broke the documented library mode and
+  the test suite on the target shell.
+- Swift: `FileHandle.close()` is macOS 10.15+ while `Package.swift` declares
+  10.13; switched to `closeFile()` so the target can compile.
+
+### Added
+- `delete-user` action, and opt-in `ST_ROLLBACK_ON_FAILURE` to remove a
+  just-created account when the grant fails.
+- Single-instance lock (exit 24) so two overlapping RMM runs cannot race.
+- Per-call watchdog (`ST_TIMEOUT`, default 120s).
+- `preflight`, `status` and `list` now emit their actual data as JSON
+  (`firstLoginGrantAvailable`, `tokenHolders[]`, `hasSecureToken`, …).
+
+### Changed / hardened
+- Admin password verified with `dscl -authonly` **before** anything is created,
+  so a stale credential cannot leave an orphaned tokenless account.
+- New account's password verified post-create; a generated password is reported
+  only once actually applied, and is still reported on later failures so the
+  account is never left unreachable.
+- `PATH` sanitised; `ST_NEW_PASSWORD`/`ST_ADMIN_PASSWORD` unset from the
+  environment after resolution; secrets scrubbed from shell state after each call.
+- `truthy()` trims whitespace/CR; `json_escape` escapes C0 controls as `\u00XX`;
+  log values stripped of control characters; log opened once on fd 3 with
+  symlink, hard-link and rotation checks.
+- UID validated (numeric, in range, not already in use); passwords reject
+  embedded newline/CR; `dscl` enumeration failure no longer reports "no holders".
+- A value-taking flag in final position now fails with exit 2 and a message.
+- Password generation reads bounded chunks (no reliance on a SIGPIPE quirk),
+  guarantees exact length, and never starts with `-`.
+- NinjaOne wrapper: propagates the core's exit code unchanged, forwards
+  arguments, uses `ninjarmm-cli set --stdin`, and refuses a core that is not
+  root-owned or is group/world-writable.
+
+### Tests
+- 46 → **69 assertions**, now covering `parse_args`/`resolve_config`,
+  environment-secret scrubbing, CR/whitespace normalisation, control-character
+  JSON escaping, and the generated-password reporting contract.
+
+---
+
 ## 2.0.0 — Unattended RMM / Intune release
 
 ### Added

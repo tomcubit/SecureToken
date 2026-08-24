@@ -4,94 +4,104 @@ Automate macOS **Secure Token** provisioning for new user accounts — with **ze
 interactive prompts**, so it runs unattended from an **RMM** (NinjaOne, Datto,
 Kaseya, Addigy, Mosyle, …) or **Microsoft Intune**.
 
-The tool creates a local account (if needed) and ensures it holds a Secure
-Token. It **prefers the escrowed Bootstrap Token** — the credential-free path
-for MDM-managed Macs — and falls back to an existing Secure Token administrator
-only when no Bootstrap Token is available.
+## Read this first: how Secure Tokens are actually granted
 
-## Why Secure Tokens (and Bootstrap Tokens) matter
+This is the part most scripts get wrong, so it drives the whole design. From
+Apple's [Platform Deployment guide](https://support.apple.com/guide/deployment/use-secure-and-bootstrap-tokens-dep24dbdcf9e/web):
 
-On APFS Macs (macOS 10.13+), a **Secure Token** is what lets a user unlock
-FileVault and authorise certain system operations. A new account created
-non-interactively often has **no** Secure Token, which breaks FileVault unlock
-for that user.
+> "Changing the secure token status of a user using `sysadminctl` **always
+> requires** the user name and password of an existing secure token–enabled
+> administrator, either interactively or through the appropriate flags."
 
-Historically, granting a token required typing an *existing* token-holder's
-credentials — impossible to do "without manually having to do anything." The
-modern answer is the **Bootstrap Token**: an MDM-escrowed key that lets macOS
-(10.15+, and required behaviour on Apple Silicon) grant Secure Tokens
-**without** any admin password. This tool is built around that path.
+> "For a Mac with macOS 11 or later, if macOS doesn't grant a secure token at
+> creation, and if a bootstrap token is available from the device management
+> service, it grants a secure token to the local user **when they log in**."
+
+Two consequences:
+
+1. **There is no credential-free `sysadminctl` grant.** A Bootstrap Token
+   *cannot* be spent by `sysadminctl`. Any script claiming otherwise will fail.
+2. **The Bootstrap Token is credential-free but deferred** — macOS grants the
+   token at the user's **first login**, not at provisioning time.
+
+So this tool implements exactly the two mechanisms that exist:
+
+| Plan | Requires | When the token appears | Reported as |
+|------|----------|------------------------|-------------|
+| **admin** | An existing Secure Token holder's username + password | Immediately, and verified during the run | `tokenMethod: "admin"` |
+| **deferred** | MDM-enrolled, macOS 11+, Bootstrap Token escrowed | At the user's **first login** | `tokenMethod: "deferred-login"` |
 
 ```
-                 ┌─────────────────────────────┐
-                 │   run securetoken.sh (root)  │
-                 └──────────────┬──────────────┘
-                                │
-              Bootstrap Token escrowed to MDM?
-                    │yes                    │no
-                    ▼                       ▼
-        grant token via Bootstrap    use existing Secure Token
-        Token (NO credentials)       admin (ST_ADMIN_USER/PW)
-                    │                       │
-                    └───────────┬───────────┘
-                                ▼
-                    verify token ENABLED, exit 0
+                    ┌──────────────────────────────┐
+                    │  run securetoken.sh (root)   │
+                    └───────────────┬──────────────┘
+                                    │
+              ST_ADMIN_USER + ST_ADMIN_PASSWORD supplied?
+                    │yes                          │no
+                    ▼                             ▼
+   verify admin holds a token AND      Bootstrap Token escrowed
+   the password authenticates          + MDM + macOS 11+ ?
+   (dscl -authonly), THEN create             │yes          │no
+                    │                        ▼             ▼
+                    ▼                 create account,   exit 22
+     sysadminctl -secureTokenOn        token granted   (no token
+       -adminUser -adminPassword       at first login   source)
+                    │                        │
+                    ▼                        ▼
+        verify ENABLED, exit 0      exit 0, tokenMethod=
+                                       deferred-login
 ```
+
+If you need the token to exist *before* first login, you must supply admin
+credentials. Set `ST_REQUIRE_IMMEDIATE_TOKEN=1` to make a deferred outcome a
+hard failure (exit 23) rather than a success.
 
 ## What's in the box
 
 | Path | Purpose |
 |------|---------|
-| `scripts/securetoken.sh` | **Primary deliverable.** Self-contained, non-interactive core. Deploy this from any RMM or Intune. |
+| `scripts/securetoken.sh` | **Primary deliverable.** Self-contained, non-interactive core. Deploy from any RMM or Intune. |
 | `scripts/intune/` | Intune portal steps + single-file config guidance. |
 | `scripts/rmm/` | RMM `ST_*` interface + NinjaOne wrapper. |
 | `scripts/secure-token-transfer.sh` | Deprecated v1 shim → forwards to the core. |
-| `Sources/SecureToken/` | Optional Swift CLI (same behaviour) for local/hands-on use. |
+| `Sources/SecureToken/` | Optional Swift CLI (same behaviour) for local use. |
 | `tests/securetoken_test.sh` | Unit tests for the shell core (run on any OS). |
 | `docs/DEPLOYMENT.md` | Step-by-step for Intune, NinjaOne, generic RMM. |
 
-The shell core targets the **bash 3.2** that ships on every macOS and has **no
-dependencies** — ideal for RMM/Intune. The Swift CLI is an optional convenience
-you compile on macOS.
+The shell core targets the **bash 3.2** shipped with every macOS and has **no
+dependencies**. The Swift CLI is an optional convenience you compile on macOS.
 
 ## Quick start
 
-### Preflight (assess readiness — start here)
+### 1. Preflight (always start here)
 
 ```bash
 sudo ST_ACTION=preflight ST_JSON=1 /bin/bash securetoken.sh
 ```
 
-Reports macOS version, MDM enrollment, whether a **Bootstrap Token is escrowed**,
-and which users already hold tokens.
+Reports macOS version, MDM enrollment, whether a Bootstrap Token is escrowed,
+whether a first-login grant is available, and which users already hold tokens —
+as both human-readable log lines and a JSON payload.
 
-### From an RMM (Bootstrap Token, no passwords)
-
-Set script variables and run the core:
-
-```bash
-ST_ACTION=create-user
-ST_NEW_USER=itadmin
-ST_NEW_FULLNAME="IT Admin"
-ST_MAKE_ADMIN=1
-ST_GENERATE_PASSWORD=1     # returns a strong password in the JSON result
-ST_JSON=1
-```
-
-See [`scripts/rmm/README.md`](scripts/rmm/README.md) and the NinjaOne wrapper.
-
-### From Intune
-
-Edit the `CONFIG` block at the top of `securetoken.sh`, upload the single file,
-and set it to run as **root**. See [`scripts/intune/README.md`](scripts/intune/README.md).
-
-### Fallback (no Bootstrap Token — supply an admin)
+### 2a. Immediate grant (admin credentials — recommended)
 
 ```bash
-sudo ST_NEW_USER=itadmin ST_NEW_PASSWORD='…' \
+sudo ST_NEW_USER=itadmin ST_NEW_FULLNAME="IT Admin" ST_MAKE_ADMIN=1 \
+     ST_GENERATE_PASSWORD=1 \
      ST_ADMIN_USER=localadmin ST_ADMIN_PASSWORD='…' \
-     /bin/bash securetoken.sh create-user
+     ST_JSON=1 /bin/bash securetoken.sh create-user
 ```
+
+### 2b. Credential-free (token arrives at first login)
+
+```bash
+sudo ST_NEW_USER=itadmin ST_MAKE_ADMIN=1 ST_GENERATE_PASSWORD=1 \
+     ST_JSON=1 /bin/bash securetoken.sh create-user
+```
+
+Succeeds with `tokenMethod: "deferred-login"` on an MDM-enrolled macOS 11+ Mac
+with an escrowed Bootstrap Token. Verify after the user's first login with
+`securetoken.sh status --new-user itadmin`.
 
 ## Configuration
 
@@ -101,20 +111,22 @@ block → default**.
 
 | Env var | Flag | Meaning |
 |---------|------|---------|
-| `ST_ACTION` | *(positional)* | `create-user` (default), `grant-token`, `status`, `list`, `preflight` |
+| `ST_ACTION` | *(positional)* | `create-user` (default), `grant-token`, `delete-user`, `status`, `list`, `preflight` |
 | `ST_NEW_USER` | `--new-user` | Username to create/target |
 | `ST_NEW_FULLNAME` | `--new-fullname` | Display name |
 | `ST_NEW_PASSWORD` | `--new-password` | Password |
 | `ST_GENERATE_PASSWORD` | `--generate-password` | Generate a strong password and return it |
 | `ST_MAKE_ADMIN` | `--make-admin` | Create an administrator |
 | `ST_HIDDEN` | `--hidden` | Hidden service account |
-| `ST_UID` | `--uid` | Explicit UID |
-| `ST_ADMIN_USER` | `--admin-user` | Existing Secure Token admin (fallback) |
+| `ST_UID` | `--uid` | Explicit UID (validated: numeric, in range, unused) |
+| `ST_ADMIN_USER` | `--admin-user` | Existing Secure Token holder (enables the immediate grant) |
 | `ST_ADMIN_PASSWORD` | `--admin-password` | That admin's password |
 | `ST_LOG_FILE` | `--log-file` | Log path (default `/var/log/securetoken.log`) |
 | `ST_JSON` | `--json` | Emit one JSON result line on stdout |
-| `ST_STDIN_SECRETS` | `--inline-secrets` (=0) | Feed passwords via stdin (default) vs inline |
-| `ST_PREFER_BOOTSTRAP` | `--no-bootstrap` (=0) | Use the Bootstrap Token when available (default) |
+| `ST_SECRET_MODE` | `--secret-mode` | `inline` (default) or `stdin` — see Security |
+| `ST_REQUIRE_IMMEDIATE_TOKEN` | `--require-immediate` | Treat a deferred grant as failure |
+| `ST_ROLLBACK_ON_FAILURE` | `--rollback-on-failure` | Delete a just-created account if the grant fails |
+| `ST_TIMEOUT` | `--timeout` | Per-`sysadminctl` watchdog, default 120s |
 
 ## Exit codes (stable contract)
 
@@ -124,37 +136,49 @@ block → default**.
 | 2 | Invalid arguments / configuration |
 | 10 | Not running as root |
 | 11 | macOS / platform unsupported |
-| 12 | Precondition failed (boot volume not APFS) |
+| 12 | Precondition failed (boot volume not APFS, no randomness) |
 | 20 | User creation failed |
 | 21 | Secure Token grant failed |
-| 22 | No Bootstrap Token **and** no valid Secure Token admin |
+| 22 | No admin credentials **and** no Bootstrap Token first-login grant available |
+| 23 | Token deferred to first login, but `ST_REQUIRE_IMMEDIATE_TOKEN=1` was set |
+| 24 | Another instance is already running |
 | 40 | Post-grant verification failed |
 
 ## Security model
 
-- **No passwords in `ps`.** Passwords are streamed to `sysadminctl` over stdin
-  (`-` placeholders), not passed as arguments. (`--inline-secrets` disables this
-  only if a specific macOS build misbehaves.)
-- **Prefer credential-free.** The Bootstrap Token path needs no stored secrets
-  at all — the recommended posture.
-- **Secrets stay out of logs.** stdout carries only the optional JSON result;
-  human-readable progress goes to stderr and `/var/log/securetoken.log`. Neither
-  ever contains a password (except `generatedPassword` in the JSON result when
-  you explicitly ask the tool to generate one — treat that output as sensitive).
-- **Least privilege.** Supply admin credentials through your RMM's *secure*
-  custom fields, never inline in the policy body.
+- **Secret delivery.** `sysadminctl`'s `-password -` form is Apple's
+  **interactive prompt** option: it reads the controlling terminal, so it cannot
+  be fed by a pipe in a headless RMM/Intune session. The default is therefore
+  `inline` (credentials as arguments — the path Apple documents for scripting),
+  which is **briefly visible in `ps`** to local users. `stdin` mode is available
+  (`ST_SECRET_MODE=stdin`) for interactive/TTY use. Every `sysadminctl` call runs
+  under a watchdog (`ST_TIMEOUT`) so an unexpected prompt can never hang a job.
+- **Credentials are verified before anything is created** with `dscl -authonly`,
+  so a stale admin password cannot leave an orphaned tokenless account.
+- **Generated passwords** are returned in the JSON result **only once actually
+  applied** to the account — and are still returned if a later step fails, so an
+  account is never left unreachable. Treat that output as sensitive.
+- **Secrets are removed from the environment** after they are read, so child
+  processes do not inherit them, and are scrubbed from shell state after use.
+- **Logs**: `PATH` is sanitised; the log is opened once, refused if it is a
+  symlink or hard-linked, created mode `0600`, rotated past 1 MB, and every
+  logged value is stripped of control characters. Passwords are never logged.
+- **Single-instance lock** prevents two overlapping runs from racing.
 
 ## Validation status
 
-- `scripts/securetoken.sh`, the NinjaOne wrapper, and the shim are **shellcheck
+- `scripts/securetoken.sh`, the NinjaOne wrapper and the shim are **shellcheck
   clean** and pass `bash -n`.
-- `tests/securetoken_test.sh` covers the core's pure logic (32 assertions) and
-  runs on any OS: `bash tests/securetoken_test.sh`.
-- The Swift CLI mirrors the shell behaviour but must be **built and tested on
-  macOS** (`swift build` / `swift test`); it is not compiled in CI on Linux.
-- End-to-end behaviour (actual `sysadminctl` token grants, Bootstrap Token use)
-  **must be validated on a test Mac** before fleet rollout — run `preflight`
-  first, then a single-device pilot.
+- `tests/securetoken_test.sh` — **69 assertions** covering the core's pure logic,
+  argument/config resolution, the JSON contract and secret scrubbing. Runs on any
+  OS: `bash tests/securetoken_test.sh`.
+- The **Swift CLI is not compiled in CI here** (Linux, no Swift toolchain). Build
+  and test it on macOS with `swift build` / `swift test` before relying on it.
+  The shell core is the supported RMM/Intune path.
+- **End-to-end behaviour must be validated on a test Mac** before fleet rollout:
+  real `sysadminctl` grants and Bootstrap Token behaviour cannot be exercised in
+  CI. Run `preflight`, then a single-device pilot — see the checklist in
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## License
 

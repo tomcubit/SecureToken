@@ -12,6 +12,7 @@ enum ExitStatus: Int32 {
     case createFailed = 20
     case grantFailed = 21
     case noTokenSource = 22
+    case tokenDeferred = 23
     case verifyFailed = 40
 }
 
@@ -36,8 +37,12 @@ struct SecureTokenError: Error, CustomStringConvertible {
 
 /// How a Secure Token was (or will be) granted.
 enum TokenMethod: String {
-    case bootstrap
+    /// Granted immediately using an existing Secure Token administrator.
     case admin
+    /// No credentials supplied; macOS will grant the token at the user's first
+    /// login via the escrowed Bootstrap Token (macOS 11+).
+    case deferredLogin = "deferred-login"
+    /// The user already held a Secure Token.
     case existing
     case none
 }
@@ -75,7 +80,7 @@ struct OperationResult {
 /// Manages Secure Token operations on macOS.
 final class SecureTokenManager {
 
-    static let version = "2.0.0"
+    static let version = "3.0.0"   // keep in lockstep with scripts/securetoken.sh
 
     private let fileManager = FileManager.default
     private let logFile: String
@@ -92,20 +97,50 @@ final class SecureTokenManager {
 
     // MARK: - Logging (stderr + file; stdout stays clean for JSON)
 
+    /// Strip C0 control characters so a crafted value cannot forge log lines.
+    private func sanitizeForLog(_ s: String) -> String {
+        return String(s.unicodeScalars.filter { $0.value >= 0x20 || $0 == "\u{09}" })
+    }
+
+    /// True once the log path has been validated for this process.
+    private var logChecked = false
+    private var logUsable = false
+
+    /// Validate the log path the same way the shell core does: refuse symlinks
+    /// and hard-linked files at a predictable root-writable path, and create it
+    /// mode 0600 rather than world-readable.
+    private func prepareLogIfNeeded() {
+        if logChecked { return }
+        logChecked = true
+        let dir = (logFile as NSString).deletingLastPathComponent
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { return }
+
+        let attrs = try? fileManager.attributesOfItem(atPath: logFile)
+        if let attrs = attrs {
+            if let type = attrs[.type] as? FileAttributeType, type == .typeSymbolicLink { return }
+            if let links = attrs[.referenceCount] as? Int, links > 1 { return }
+        } else {
+            guard fileManager.createFile(atPath: logFile, contents: nil,
+                                         attributes: [.posixPermissions: 0o600]) else { return }
+        }
+        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logFile)
+        logUsable = true
+    }
+
     private func log(_ level: String, _ message: String) {
         let ts = ISO8601DateFormatter().string(from: Date())
-        let line = "\(ts) [\(level)] \(message)"
+        let line = "\(ts) [\(level)] \(sanitizeForLog(message))"
         FileHandle.standardError.write((line + "\n").data(using: .utf8) ?? Data())
-        if let data = (line + "\n").data(using: .utf8) {
-            if !fileManager.fileExists(atPath: logFile) {
-                fileManager.createFile(atPath: logFile, contents: nil)
-            }
-            if let handle = FileHandle(forWritingAtPath: logFile) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            }
-        }
+
+        prepareLogIfNeeded()
+        guard logUsable, let data = (line + "\n").data(using: .utf8),
+              let handle = FileHandle(forWritingAtPath: logFile) else { return }
+        handle.seekToEndOfFile()
+        handle.write(data)
+        // closeFile() rather than close(): close() is macOS 10.15+, and
+        // Package.swift declares a 10.13 deployment target.
+        handle.closeFile()
     }
     func info(_ m: String) { log("INFO", m) }
     func warn(_ m: String) { log("WARN", m) }
@@ -150,7 +185,7 @@ final class SecureTokenManager {
             for secret in secrets {
                 handle.write((secret + "\n").data(using: .utf8) ?? Data())
             }
-            try? handle.close()
+            handle.closeFile()   // closeFile(): close() requires macOS 10.15+
         }
 
         let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
@@ -295,23 +330,42 @@ final class SecureTokenManager {
 
     // MARK: - Token method resolution
 
-    /// Decide how the token can be granted. Throws if neither a Bootstrap Token
-    /// nor a valid Secure Token admin is available.
-    func resolveTokenMethod(adminUser: String?, adminPassword: String?) throws -> (TokenMethod, String?, String?) {
-        if preferBootstrap,
-           versionAtLeast(macOSVersion(), "10.15.0"),
-           mdmEnrolled(), bootstrapTokenEscrowed() {
-            info("Bootstrap Token is escrowed — granting without admin credentials")
-            return (.bootstrap, nil, nil)
-        }
+    /// Verify a password actually authenticates for a user.
+    func passwordAuthenticates(_ user: String, _ password: String) -> Bool {
+        run("/usr/bin/dscl", [".", "-authonly", user, password]).exitCode == 0
+    }
+
+    /// Can macOS grant the token at first login via an escrowed Bootstrap Token?
+    /// Requires macOS 11+ (grant-at-login for scripted local users).
+    func bootstrapLoginGrantAvailable() -> Bool {
+        versionAtLeast(macOSVersion(), "11.0.0") && mdmEnrolled() && bootstrapTokenEscrowed()
+    }
+
+    /// Decide how the token will be obtained.
+    ///
+    /// Per Apple's Platform Deployment guide, changing secure token status with
+    /// sysadminctl ALWAYS requires an existing secure token administrator's
+    /// credentials — a Bootstrap Token cannot be spent by sysadminctl. The
+    /// Bootstrap Token instead causes macOS to grant the token at the user's
+    /// first login (macOS 11+). So the admin path is preferred (immediate and
+    /// verifiable) and the bootstrap path is a deferred fallback.
+    func resolveTokenPlan(adminUser: String?, adminPassword: String?) throws -> (TokenMethod, String?, String?) {
         if let au = adminUser, let ap = adminPassword, !au.isEmpty, !ap.isEmpty {
             guard userExists(au) else { throw SecureTokenError.noTokenSource("Token admin '\(au)' does not exist") }
             guard hasSecureToken(au) else { throw SecureTokenError.noTokenSource("Token admin '\(au)' has no Secure Token") }
-            info("Granting token using Secure Token admin '\(au)'")
+            guard passwordAuthenticates(au, ap) else {
+                throw SecureTokenError.noTokenSource("Token admin '\(au)' password is incorrect (verified with dscl -authonly)")
+            }
+            info("Token plan: immediate grant using Secure Token admin '\(au)'")
             return (.admin, au, ap)
         }
+        if preferBootstrap, bootstrapLoginGrantAvailable() {
+            info("Token plan: no admin credentials; Bootstrap Token will grant the token at FIRST LOGIN (macOS 11+)")
+            return (.deferredLogin, nil, nil)
+        }
         throw SecureTokenError.noTokenSource(
-            "No Bootstrap Token escrowed and no valid Secure Token admin supplied")
+            "No Secure Token admin credentials supplied and no Bootstrap Token available for a first-login grant. "
+            + "sysadminctl cannot grant a Secure Token without an existing token holder's credentials.")
     }
 
     // MARK: - Operations
@@ -332,14 +386,24 @@ final class SecureTokenManager {
         if r.exitCode != 0 || !userExists(username) {
             throw SecureTokenError.createFailed("Failed to create '\(username)': \(r.combined)")
         }
+        // Confirm the password we believe we set actually authenticates, so a
+        // mis-delivered secret is caught before the credential is handed back.
+        guard passwordAuthenticates(username, password) else {
+            throw SecureTokenError.createFailed(
+                "User '\(username)' was created but the intended password does not authenticate. Investigate before using this account.")
+        }
         _ = run("/usr/sbin/createhomedir", ["-c", "-u", username])
         if hidden {
-            _ = run("/usr/bin/dscl", [".", "-create", "/Users/\(username)", "IsHidden", "1"])
+            let h = run("/usr/bin/dscl", [".", "-create", "/Users/\(username)", "IsHidden", "1"])
+            if h.exitCode != 0 {
+                warn("Could not set IsHidden on '\(username)' — the account will be visible at the login window")
+            }
         }
         info("User '\(username)' created")
     }
 
-    /// Ensure `user` holds a Secure Token. Returns the method used.
+    /// Ensure `user` ends up with a Secure Token, or that a deferred first-login
+    /// grant is arranged. Returns the method used.
     @discardableResult
     func ensureToken(user: String, password: String, adminUser: String?, adminPassword: String?) throws -> TokenMethod {
         if hasSecureToken(user) {
@@ -349,27 +413,24 @@ final class SecureTokenManager {
         if !bootIsAPFS() {
             throw SecureTokenError.precondition("Boot volume is not APFS; Secure Tokens unavailable")
         }
-        let (method, au, ap) = try resolveTokenMethod(adminUser: adminUser, adminPassword: adminPassword)
+        let (method, au, ap) = try resolveTokenPlan(adminUser: adminUser, adminPassword: adminPassword)
 
-        let template: [String]
-        let secrets: [String]
-        switch method {
-        case .bootstrap:
-            template = ["-secureTokenOn", user, "-password", S]
-            secrets = [password]
-        default:
-            template = ["-secureTokenOn", user, "-password", S, "-adminUser", au ?? "", "-adminPassword", S]
-            secrets = [password, ap ?? ""]
+        if method == .deferredLogin {
+            info("Secure Token will be granted by macOS at '\(user)' first login (Bootstrap Token). No token is present yet — this is expected.")
+            return .deferredLogin
         }
 
-        let r = runSysadminctl(template, secretValues: secrets)
+        let template = ["-secureTokenOn", user, "-password", S, "-adminUser", au ?? "", "-adminPassword", S]
+        let r = runSysadminctl(template, secretValues: [password, ap ?? ""])
         if r.exitCode != 0 {
-            throw SecureTokenError.grantFailed("Failed to grant token to '\(user)' via \(method.rawValue): \(r.combined)")
+            throw SecureTokenError.grantFailed("Failed to grant token to '\(user)': \(r.combined)")
         }
+        // sysadminctl often exits 0 even when the grant failed, so the status
+        // re-read is the authoritative check.
         if !hasSecureToken(user) {
             throw SecureTokenError.verifyFailed("Secure Token not ENABLED for '\(user)' after grant")
         }
-        info("Secure Token granted to '\(user)' via \(method.rawValue)")
-        return method
+        info("Secure Token granted to '\(user)' via admin '\(au ?? "")'")
+        return .admin
     }
 }
