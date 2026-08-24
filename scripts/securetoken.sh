@@ -235,11 +235,29 @@ list_local_users() {
 }
 
 # Next free UID at or above a floor (used for hidden accounts / explicit ranges).
+# first_unused_uid <floor> <ceiling> : reads a newline list of used UIDs on
+# stdin and prints the first UID in [floor, ceiling) that is NOT in the list.
+# Returns 1 (no output) if the range is exhausted. Pure — unit-testable.
+first_unused_uid() {
+    local floor="$1" ceiling="$2" used candidate
+    used=$(cat)
+    candidate="$floor"
+    while [ "$candidate" -lt "$ceiling" ]; do
+        if ! printf '%s\n' "$used" | /usr/bin/grep -qx "$candidate"; then
+            printf '%s' "$candidate"; return 0
+        fi
+        candidate=$((candidate + 1))
+    done
+    return 1
+}
+
+# Pick the first free UID in a low, hidden-friendly range [floor, ceiling).
+# For hidden service accounts we want a UID < 500 so the login window hides it,
+# rather than one above the existing interactive users.
 next_free_uid() {
-    local floor="$1" used max
-    used=$(/usr/bin/dscl . -list /Users UniqueID 2>/dev/null | /usr/bin/awk '{print $2}')
-    max=$(printf '%s\n' "$used" | /usr/bin/awk -v f="$floor" '$1+0>=f && $1+0>max{max=$1+0} END{print max+0}')
-    if [ "$max" -lt "$floor" ]; then printf '%s' "$floor"; else printf '%s' "$((max + 1))"; fi
+    local floor="$1" ceiling="${2:-500}"
+    /usr/bin/dscl . -list /Users UniqueID 2>/dev/null | /usr/bin/awk '{print $2}' \
+        | first_unused_uid "$floor" "$ceiling"
 }
 
 # ===========================================================================
@@ -296,33 +314,45 @@ generate_password() {
 #   run_sysadminctl   # reads the two arrays; sets SYS_OUT and returns rc
 # ===========================================================================
 SYS_OUT=""
-run_sysadminctl() {
-    local -a args=()
-    local -a fed=()
-    local a
-    # Build the effective argument list, replacing @@ST_SECRET@@ tokens.
-    local si=0
+BUILT_ARGS=()
+BUILT_FED=()
+
+# build_sysadminctl_args — pure transform of SYS_ARGS/SYS_SECRETS into the arrays
+# BUILT_ARGS (the argv passed to sysadminctl) and BUILT_FED (secrets to stream on
+# stdin, in placeholder order). Separated from execution so it is unit-testable
+# on any OS. Element order and embedded spaces are preserved exactly.
+build_sysadminctl_args() {
+    BUILT_ARGS=()
+    BUILT_FED=()
+    local a secret si=0
     for a in ${SYS_ARGS[@]+"${SYS_ARGS[@]}"}; do
         if [ "$a" = "@@ST_SECRET@@" ]; then
-            local secret="${SYS_SECRETS[si]:-}"
+            secret="${SYS_SECRETS[si]:-}"
             si=$((si + 1))
             if [ "$STDIN_SECRETS" = "1" ]; then
-                args+=( "-" )
-                fed+=( "$secret" )
+                BUILT_ARGS+=( "-" )
+                BUILT_FED+=( "$secret" )
             else
-                args+=( "$secret" )
+                BUILT_ARGS+=( "$secret" )
             fi
         else
-            args+=( "$a" )
+            BUILT_ARGS+=( "$a" )
         fi
     done
+}
 
+run_sysadminctl() {
+    build_sysadminctl_args
     local rc=0
-    if [ "$STDIN_SECRETS" = "1" ] && [ "${#fed[@]}" -gt 0 ]; then
-        SYS_OUT=$(printf '%s\n' ${fed[@]+"${fed[@]}"} | /usr/sbin/sysadminctl ${args[@]+"${args[@]}"} 2>&1) || rc=$?
+    if [ "$STDIN_SECRETS" = "1" ] && [ "${#BUILT_FED[@]}" -gt 0 ]; then
+        SYS_OUT=$(printf '%s\n' ${BUILT_FED[@]+"${BUILT_FED[@]}"} \
+                    | /usr/sbin/sysadminctl ${BUILT_ARGS[@]+"${BUILT_ARGS[@]}"} 2>&1) || rc=$?
     else
-        SYS_OUT=$(/usr/sbin/sysadminctl ${args[@]+"${args[@]}"} 2>&1) || rc=$?
+        SYS_OUT=$(/usr/sbin/sysadminctl ${BUILT_ARGS[@]+"${BUILT_ARGS[@]}"} 2>&1) || rc=$?
     fi
+    # Scrub secrets from lingering globals as soon as the call returns.
+    SYS_SECRETS=()
+    BUILT_FED=()
     log_debug "sysadminctl rc=$rc"
     return "$rc"
 }
@@ -348,6 +378,10 @@ require_token_preconditions() {
 # Sets TOKEN_METHOD to "bootstrap" or "admin"; dies with EX_NO_TOKEN_SOURCE if
 # neither is viable.
 resolve_token_method() {
+    # Idempotent: if a method was already resolved this run, don't re-log/re-check.
+    if [ -n "$TOKEN_METHOD" ] && [ "$TOKEN_METHOD" != "existing" ]; then
+        return 0
+    fi
     if [ "$PREFER_BOOTSTRAP" = "1" ] \
        && version_ge "$(macos_product_version)" "10.15.0" \
        && mdm_enrolled && bootstrap_token_escrowed; then
@@ -383,15 +417,16 @@ create_user() {
 
     local uid="$NEW_UID"
     if [ "$HIDDEN" = "1" ] && [ -z "$uid" ]; then
-        uid=$(next_free_uid 200)
+        # Best-effort low UID; if none free in 200-499, fall back to auto-assign.
+        uid=$(next_free_uid 200 500) || uid=""
     fi
 
     log_info "Creating user '$user' (admin=$MAKE_ADMIN hidden=$HIDDEN uid=${uid:-auto})"
 
     SYS_ARGS=( -addUser "$user" -fullName "$fullname" -password @@ST_SECRET@@ )
     SYS_SECRETS=( "$password" )
-    [ -n "$uid" ] && SYS_ARGS+=( -UID "$uid" )
-    [ "$MAKE_ADMIN" = "1" ] && SYS_ARGS+=( -admin )
+    if [ -n "$uid" ]; then SYS_ARGS+=( -UID "$uid" ); fi
+    if [ "$MAKE_ADMIN" = "1" ]; then SYS_ARGS+=( -admin ); fi
     # When creating via an admin (no bootstrap), sysadminctl can take the
     # admin credentials here too, but user creation itself does not require a
     # token; we keep creation and token-grant as separate, verifiable steps.
@@ -573,6 +608,11 @@ do_create_user() {
         log_warn "User '$NEW_USER' already exists; token grant will use the supplied password and will fail if it does not match the account's real password"
     fi
 
+    # Fail fast: confirm a token source is viable BEFORE creating the account, so
+    # an invalid admin credential never leaves a tokenless orphan user behind.
+    require_token_preconditions
+    resolve_token_method
+
     create_user "$NEW_USER" "$NEW_FULLNAME" "$NEW_PASSWORD"
     grant_token "$NEW_USER" "$NEW_PASSWORD"
 
@@ -677,11 +717,18 @@ resolve_config() {
     JSON_MODE="$JSON"
     ACTION=$(pick "$ACTION" "_none_" "" "create-user")  # default action
 
-    # Best-effort: ensure the log directory is writable; fall back silently.
+    # Best-effort log setup; disable file logging rather than failing the run.
     local dir
     dir=$(dirname "$LOG_FILE")
     if [ ! -d "$dir" ] || [ ! -w "$dir" ]; then
-        LOG_FILE=""  # disable file logging rather than failing the run
+        LOG_FILE=""
+    elif [ -L "$LOG_FILE" ]; then
+        # Refuse to write through a symlink at the predictable path (a planted
+        # symlink could otherwise redirect our root-owned writes elsewhere).
+        LOG_FILE=""
+    elif [ ! -e "$LOG_FILE" ]; then
+        # Create it non-world-readable up front.
+        ( umask 077; : >>"$LOG_FILE" ) 2>/dev/null || LOG_FILE=""
     fi
 }
 

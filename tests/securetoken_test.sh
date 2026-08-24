@@ -94,6 +94,44 @@ esac
 JSON_MODE=0
 assert_eq "silent when JSON off" "" "$(emit_result ok 0 'done')"
 
+echo "build_sysadminctl_args():"
+# stdin mode, one secret, full name with a space (must be preserved as one arg)
+SYS_ARGS=( -addUser foo -fullName "Foo Bar" -password @@ST_SECRET@@ )
+SYS_SECRETS=( "s3cr3t pw" )
+STDIN_SECRETS=1
+build_sysadminctl_args
+assert_eq "stdin: arg count"        "6"          "${#BUILT_ARGS[@]}"
+assert_eq "stdin: spaced fullname"  "Foo Bar"    "${BUILT_ARGS[3]}"
+assert_eq "stdin: placeholder -> -" "-"          "${BUILT_ARGS[5]}"
+assert_eq "stdin: fed count"        "1"          "${#BUILT_FED[@]}"
+assert_eq "stdin: fed value"        "s3cr3t pw"  "${BUILT_FED[0]}"
+
+# inline mode: secret goes into argv, nothing fed on stdin
+STDIN_SECRETS=0
+build_sysadminctl_args
+assert_eq "inline: secret in argv"  "s3cr3t pw"  "${BUILT_ARGS[5]}"
+assert_eq "inline: nothing fed"     "0"          "${#BUILT_FED[@]}"
+
+# two secrets must be fed in placeholder order
+SYS_ARGS=( -secureTokenOn foo -password @@ST_SECRET@@ -adminUser bar -adminPassword @@ST_SECRET@@ )
+SYS_SECRETS=( "userpw" "adminpw" )
+STDIN_SECRETS=1
+build_sysadminctl_args
+assert_eq "order: fed count"  "2"        "${#BUILT_FED[@]}"
+assert_eq "order: first fed"  "userpw"   "${BUILT_FED[0]}"
+assert_eq "order: second fed" "adminpw"  "${BUILT_FED[1]}"
+
+echo "first_unused_uid():"
+assert_eq "empty list -> floor"      "200" "$(printf '' | first_unused_uid 200 500)"
+assert_eq "skips used from floor"    "202" "$(printf '200\n201\n501\n' | first_unused_uid 200 500)"
+assert_eq "gap in middle"            "201" "$(printf '200\n202\n' | first_unused_uid 200 500)"
+# range exhausted -> non-zero, no output
+if printf '200\n201\n' | first_unused_uid 200 202 >/dev/null; then
+    bad "exhausted range should fail"
+else
+    ok "exhausted range returns non-zero"
+fi
+
 echo
 echo "-----------------------------------------"
 printf 'RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"

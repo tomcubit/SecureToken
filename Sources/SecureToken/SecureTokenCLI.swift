@@ -40,10 +40,7 @@ func fail(json: Bool, action: String, user: String, method: TokenMethod, _ error
 }
 
 func requireDarwinRootSupported(_ mgr: SecureTokenManager, json: Bool, action: String) {
-    #if !os(macOS)
-    fail(json: json, action: action, user: "", method: .none,
-         SecureTokenError.unsupported("This tool runs on macOS only"))
-    #endif
+    #if os(macOS)
     guard mgr.isRoot() else {
         fail(json: json, action: action, user: "", method: .none,
              SecureTokenError.notRoot("Must run as root (use sudo or an RMM/Intune run-as-root policy)"))
@@ -52,6 +49,10 @@ func requireDarwinRootSupported(_ mgr: SecureTokenManager, json: Bool, action: S
         fail(json: json, action: action, user: "", method: .none,
              SecureTokenError.unsupported("Secure Tokens require macOS 10.13+ (found \(mgr.macOSVersion()))"))
     }
+    #else
+    fail(json: json, action: action, user: "", method: .none,
+         SecureTokenError.unsupported("This tool runs on macOS only"))
+    #endif
 }
 
 // MARK: - Root command
