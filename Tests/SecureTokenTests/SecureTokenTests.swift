@@ -3,188 +3,115 @@ import XCTest
 
 final class SecureTokenTests: XCTestCase {
 
-    var manager: SecureTokenManager!
+    var mgr: SecureTokenManager!
 
     override func setUp() {
         super.setUp()
-        manager = SecureTokenManager()
+        // Use a temp log path so tests never touch /var/log.
+        mgr = SecureTokenManager(logFile: NSTemporaryDirectory() + "securetoken-test.log")
     }
 
-    override func tearDown() {
-        manager = nil
-        super.tearDown()
+    override func tearDown() { mgr = nil; super.tearDown() }
+
+    // MARK: - Version comparison (platform-independent)
+
+    func testVersionAtLeast() {
+        XCTAssertTrue(mgr.versionAtLeast("14.5.0", "10.13.0"))
+        XCTAssertTrue(mgr.versionAtLeast("10.13.0", "10.13.0"))
+        XCTAssertTrue(mgr.versionAtLeast("11.0.1", "10.15.0"))
+        XCTAssertTrue(mgr.versionAtLeast("15", "10.13.0"))
+        XCTAssertFalse(mgr.versionAtLeast("10.12.6", "10.13.0"))
+        XCTAssertFalse(mgr.versionAtLeast("9.9", "10.0"))
     }
 
-    // MARK: - Version Check Tests
+    // MARK: - Username validation
 
-    func testMacOSVersionCheck() {
-        // This test will pass on macOS 10.13+ and fail on earlier versions
-        // On non-macOS systems, behavior depends on ProcessInfo
-        let result = manager.checkMacOSVersion()
-        #if os(macOS)
-        // On actual macOS, this should typically be true for modern systems
-        XCTAssertTrue(result, "Should detect compatible macOS version")
-        #endif
-    }
-
-    // MARK: - Root Check Tests
-
-    func testIsRunningAsRoot() {
-        // When running tests normally, we're not root
-        let isRoot = manager.isRunningAsRoot()
-        #if os(macOS)
-        // Normal test execution should not be as root
-        XCTAssertFalse(isRoot, "Tests should not run as root")
-        #endif
-    }
-
-    // MARK: - User Listing Tests
-
-    func testListAllUsers() {
-        #if os(macOS)
-        let users = manager.listAllUsers()
-        // Should return at least one user on any macOS system
-        XCTAssertGreaterThan(users.count, 0, "Should find at least one user")
-
-        // Should not include system users
-        XCTAssertFalse(users.contains("daemon"), "Should not include daemon")
-        XCTAssertFalse(users.contains("nobody"), "Should not include nobody")
-
-        // Should not include underscore-prefixed system accounts
-        let systemUsers = users.filter { $0.hasPrefix("_") }
-        XCTAssertEqual(systemUsers.count, 0, "Should not include system accounts starting with _")
-        #endif
-    }
-
-    // MARK: - User Existence Tests
-
-    func testUserExistsForSystemUser() {
-        #if os(macOS)
-        // Root should always exist on macOS
-        XCTAssertTrue(manager.userExists(username: "root"), "root user should exist")
-        #endif
-    }
-
-    func testUserExistsForNonexistentUser() {
-        #if os(macOS)
-        // Random username should not exist
-        let randomUser = "nonexistent_user_\(UUID().uuidString.prefix(8))"
-        XCTAssertFalse(manager.userExists(username: randomUser), "Random user should not exist")
-        #endif
-    }
-
-    // MARK: - Validation Tests
-
-    func testValidUsernameFormats() {
-        // These tests use the internal validation logic
-        // Valid usernames
-        let validUsernames = [
-            "john",
-            "john_doe",
-            "john-doe",
-            "johndoe123",
-            "a",
-            "user1"
-        ]
-
-        for username in validUsernames {
-            XCTAssertTrue(isValidUsername(username), "'\(username)' should be valid")
+    func testValidUsernames() throws {
+        for u in ["jsmith", "a_b-c1", "User1", "a"] {
+            XCTAssertNoThrow(try mgr.validateUsername(u), "'\(u)' should be valid")
         }
     }
 
-    func testInvalidUsernameFormats() {
-        // Invalid usernames
-        let invalidUsernames = [
-            "",              // empty
-            "123user",       // starts with number
-            "_user",         // starts with underscore
-            "-user",         // starts with hyphen
-            "user name",     // contains space
-            "user@name",     // contains special character
-            "root",          // reserved
-            "daemon",        // reserved
-            "nobody"         // reserved
-        ]
-
-        for username in invalidUsernames {
-            XCTAssertFalse(isValidUsername(username), "'\(username)' should be invalid")
+    func testInvalidUsernames() {
+        for u in ["", "1abc", "_svc", "-x", "has space", "user@host", "root", "ROOT", "daemon"] {
+            XCTAssertThrowsError(try mgr.validateUsername(u), "'\(u)' should be rejected") { err in
+                XCTAssertTrue(err is SecureTokenError)
+                if let e = err as? SecureTokenError {
+                    XCTAssertEqual(e.status, .usage)
+                }
+            }
         }
     }
 
     func testPasswordValidation() {
-        // Valid passwords
-        XCTAssertTrue(isValidPassword("password"), "Basic password should be valid")
-        XCTAssertTrue(isValidPassword("12345"), "Numeric password should be valid")
-        XCTAssertTrue(isValidPassword("abcd"), "Short password (4 chars) should be valid")
-
-        // Invalid passwords
-        XCTAssertFalse(isValidPassword(""), "Empty password should be invalid")
-        XCTAssertFalse(isValidPassword("abc"), "Too short password should be invalid")
+        XCTAssertNoThrow(try mgr.validatePassword("abcd"))
+        XCTAssertNoThrow(try mgr.validatePassword("longenoughpassword"))
+        XCTAssertThrowsError(try mgr.validatePassword("abc"))
+        XCTAssertThrowsError(try mgr.validatePassword(""))
     }
 
-    // MARK: - Helper Functions for Validation Tests
+    // MARK: - Password generation
 
-    private func isValidUsername(_ username: String) -> Bool {
-        // Replicating validation logic from SecureTokenManager
-        guard username.count >= 1 && username.count <= 255 else { return false }
-        guard let first = username.first, first.isLetter else { return false }
-
-        let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-        guard username.unicodeScalars.allSatisfy({ allowedCharacters.contains($0) }) else { return false }
-
-        let reserved = ["root", "daemon", "nobody", "admin", "wheel", "kmem", "sys", "tty"]
-        guard !reserved.contains(username.lowercased()) else { return false }
-
-        return true
-    }
-
-    private func isValidPassword(_ password: String) -> Bool {
-        return password.count >= 4
-    }
-
-    // MARK: - Integration Tests (require root)
-
-    func testSecureTokenStatusCheck() {
-        #if os(macOS)
-        // This test checks that the status check doesn't crash
-        // Actual token status depends on the user
-        _ = manager.checkSecureTokenStatus(username: "nonexistent_user_test")
-        // If we got here without crashing, the test passes
-        #endif
-    }
-
-    // MARK: - Error Type Tests
-
-    func testErrorDescriptions() {
-        let errors: [SecureTokenError] = [
-            .unsupportedSystem("Test message"),
-            .insufficientPrivileges("Test message"),
-            .noSecureToken("Test message"),
-            .userCreationFailed("Test message"),
-            .tokenGrantFailed("Test message"),
-            .userAlreadyExists("Test message"),
-            .validationError("Test message"),
-            .commandFailed("test", 1)
-        ]
-
-        for error in errors {
-            let description = error.description
-            XCTAssertFalse(description.isEmpty, "Error should have a description")
-            XCTAssertTrue(description.contains("Test message") || description.contains("test"),
-                         "Error description should contain the message")
+    func testGeneratePassword() {
+        let a = mgr.generatePassword(length: 20)
+        let b = mgr.generatePassword(length: 20)
+        XCTAssertEqual(a.count, 20)
+        XCTAssertEqual(b.count, 20)
+        XCTAssertNotEqual(a, b, "two generations should differ")
+        // No ambiguous characters (0/O/1/l/I) in the alphabet.
+        for ch in "0O1lI" {
+            XCTAssertFalse(a.contains(ch), "generated password should avoid ambiguous '\(ch)'")
         }
     }
 
-    static var allTests = [
-        ("testMacOSVersionCheck", testMacOSVersionCheck),
-        ("testIsRunningAsRoot", testIsRunningAsRoot),
-        ("testListAllUsers", testListAllUsers),
-        ("testUserExistsForSystemUser", testUserExistsForSystemUser),
-        ("testUserExistsForNonexistentUser", testUserExistsForNonexistentUser),
-        ("testValidUsernameFormats", testValidUsernameFormats),
-        ("testInvalidUsernameFormats", testInvalidUsernameFormats),
-        ("testPasswordValidation", testPasswordValidation),
-        ("testSecureTokenStatusCheck", testSecureTokenStatusCheck),
-        ("testErrorDescriptions", testErrorDescriptions),
-    ]
+    // MARK: - Exit-code contract
+
+    func testExitCodeContract() {
+        XCTAssertEqual(ExitStatus.ok.rawValue, 0)
+        XCTAssertEqual(ExitStatus.usage.rawValue, 2)
+        XCTAssertEqual(ExitStatus.notRoot.rawValue, 10)
+        XCTAssertEqual(ExitStatus.unsupported.rawValue, 11)
+        XCTAssertEqual(ExitStatus.precondition.rawValue, 12)
+        XCTAssertEqual(ExitStatus.createFailed.rawValue, 20)
+        XCTAssertEqual(ExitStatus.grantFailed.rawValue, 21)
+        XCTAssertEqual(ExitStatus.noTokenSource.rawValue, 22)
+        XCTAssertEqual(ExitStatus.verifyFailed.rawValue, 40)
+    }
+
+    // MARK: - JSON result serialisation
+
+    func testJSONResultShape() {
+        let r = OperationResult(status: "ok", exitCode: 0, action: "create-user",
+                                user: "itadmin", tokenMethod: "bootstrap",
+                                message: "done", generatedPassword: nil)
+        let line = r.jsonLine(version: "2.0.0")
+        XCTAssertTrue(line.contains("\"tool\":\"securetoken\""))
+        XCTAssertTrue(line.contains("\"status\":\"ok\""))
+        XCTAssertTrue(line.contains("\"exitCode\":0"))
+        XCTAssertTrue(line.contains("\"user\":\"itadmin\""))
+        XCTAssertTrue(line.contains("\"tokenMethod\":\"bootstrap\""))
+        XCTAssertFalse(line.contains("generatedPassword"), "should omit when nil")
+    }
+
+    func testJSONResultEscaping() {
+        let r = OperationResult(status: "error", exitCode: 20, action: "create-user",
+                                user: "he\"quote", tokenMethod: "none",
+                                message: "line1\nline2\ttab", generatedPassword: "p\\w")
+        let line = r.jsonLine(version: "2.0.0")
+        XCTAssertTrue(line.contains("he\\\"quote"))
+        XCTAssertTrue(line.contains("line1\\nline2\\ttab"))
+        XCTAssertTrue(line.contains("\"generatedPassword\":\"p\\\\w\""))
+    }
+
+    // MARK: - macOS-only smoke tests (do not assert environment specifics)
+
+    func testProbesDoNotCrash() {
+        #if os(macOS)
+        _ = mgr.isRoot()
+        _ = mgr.macOSVersion()
+        _ = mgr.isAppleSilicon()
+        _ = mgr.localUsers()
+        _ = mgr.userExists("definitely_not_a_user_\(UUID().uuidString.prefix(6))")
+        #endif
+    }
 }

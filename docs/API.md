@@ -1,331 +1,97 @@
-# SecureToken API Reference
+# API & Interface Reference
 
-This document describes the programmatic API for the SecureToken tool.
+Covers the shell core (`scripts/securetoken.sh`) — the primary interface — and
+the optional Swift library. For deployment walkthroughs see
+[DEPLOYMENT.md](DEPLOYMENT.md).
 
-## Table of Contents
+## Actions
 
-- [SecureTokenManager Class](#securetokenmanager-class)
-- [Commands](#commands)
-- [Error Types](#error-types)
-- [Shell Script API](#shell-script-api)
+| Action | Description |
+|--------|-------------|
+| `create-user` (default) | Create the user if absent, then ensure it holds a Secure Token. Idempotent. |
+| `grant-token` | Grant a Secure Token to an **existing** user. |
+| `status` | Report token status for a user. |
+| `list` | List all users holding a Secure Token. |
+| `preflight` | Report readiness: macOS version, arch, root, APFS, MDM, Bootstrap Token, token holders. |
 
-## SecureTokenManager Class
+Select an action via the positional argument (`securetoken.sh create-user`),
+`ST_ACTION`, or `CONFIG_ACTION`.
 
-The core class that handles all secure token operations.
+## Configuration precedence
 
-### Initialization
+For every setting: **CLI flag → `ST_*` environment variable → `CONFIG_*` block →
+built-in default**. See the table in the [README](../README.md#configuration).
 
-```swift
-let manager = SecureTokenManager()
-```
+## Output contract
 
-### Methods
+- **stdout**: nothing, unless JSON mode is on (`--json` / `ST_JSON=1`), in which
+  case exactly one JSON object is printed as the final line:
 
-#### checkMacOSVersion()
+  ```json
+  {"tool":"securetoken","version":"2.0.0","status":"ok","exitCode":0,
+   "action":"create-user","user":"itadmin","tokenMethod":"bootstrap",
+   "message":"user created and secure token granted"}
+  ```
 
-Checks if the current system supports secure tokens.
+  `generatedPassword` is present only when `--generate-password` produced one.
+  `tokenMethod` is one of `bootstrap`, `admin`, `existing`, `none`.
 
-```swift
-func checkMacOSVersion() -> Bool
-```
+- **stderr + `/var/log/securetoken.log`**: timestamped, human-readable progress.
+  Never contains passwords.
 
-**Returns:** `true` if macOS 10.13 or later, `false` otherwise.
+- **exit code**: the stable contract in the [README](../README.md#exit-codes-stable-contract).
 
----
+## macOS commands used
 
-#### isRunningAsRoot()
+| Command | Use |
+|---------|-----|
+| `sysadminctl -addUser … -password -` | Create a user (password via stdin). |
+| `sysadminctl -secureTokenOn … -password -` | Grant token (Bootstrap Token path, no admin creds). |
+| `sysadminctl -secureTokenOn … -adminUser … -adminPassword -` | Grant token via existing admin. |
+| `sysadminctl -secureTokenStatus <user>` | Read token status. |
+| `dscl . -list/-read/-create /Users` | Enumerate/inspect/modify accounts. |
+| `profiles status -type enrollment` | Detect MDM enrollment. |
+| `profiles status -type bootstraptoken` | Detect Bootstrap Token escrow. |
+| `diskutil info /` | Confirm APFS boot volume. |
+| `createhomedir -c -u <user>` | Ensure the home directory exists. |
+| `sw_vers -productVersion`, `uname -m` | Version / architecture. |
 
-Checks if the current process has root privileges.
+The `-` after `-password` / `-adminPassword` tells `sysadminctl` to read that
+secret from stdin, keeping it out of the process table. Set `ST_STDIN_SECRETS=0`
+to pass secrets inline instead (fallback only).
 
-```swift
-func isRunningAsRoot() -> Bool
-```
+## Shell library (for tests / extension)
 
-**Returns:** `true` if running as root (UID 0), `false` otherwise.
-
----
-
-#### checkSecureTokenStatus(username:)
-
-Checks if a user has a secure token.
-
-```swift
-func checkSecureTokenStatus(username: String) -> Bool
-```
-
-**Parameters:**
-- `username`: The username to check
-
-**Returns:** `true` if the user has a secure token, `false` otherwise.
-
----
-
-#### listAllUsers()
-
-Lists all local user accounts (excluding system accounts).
-
-```swift
-func listAllUsers() -> [String]
-```
-
-**Returns:** An array of usernames.
-
----
-
-#### userExists(username:)
-
-Checks if a user account exists.
-
-```swift
-func userExists(username: String) -> Bool
-```
-
-**Parameters:**
-- `username`: The username to check
-
-**Returns:** `true` if the user exists, `false` otherwise.
-
----
-
-#### createUserWithSecureToken(...)
-
-Creates a new user account and grants a secure token.
-
-```swift
-func createUserWithSecureToken(
-    newUsername: String,
-    newFullName: String,
-    newPassword: String,
-    adminUsername: String,
-    adminPassword: String,
-    makeAdmin: Bool
-) throws
-```
-
-**Parameters:**
-- `newUsername`: Username for the new account
-- `newFullName`: Display name for the new account
-- `newPassword`: Password for the new account
-- `adminUsername`: Admin user who will grant the token
-- `adminPassword`: Admin user's password
-- `makeAdmin`: Whether to make the new user an administrator
-
-**Throws:** `SecureTokenError` if the operation fails.
-
----
-
-#### grantSecureToken(...)
-
-Grants a secure token to an existing user.
-
-```swift
-func grantSecureToken(
-    targetUsername: String,
-    targetPassword: String,
-    adminUsername: String,
-    adminPassword: String
-) throws
-```
-
-**Parameters:**
-- `targetUsername`: User to grant token to
-- `targetPassword`: Target user's password
-- `adminUsername`: Admin user with secure token
-- `adminPassword`: Admin user's password
-
-**Throws:** `SecureTokenError` if the operation fails.
-
----
-
-#### revokeSecureToken(...)
-
-Revokes a secure token from a user.
-
-```swift
-func revokeSecureToken(
-    targetUsername: String,
-    targetPassword: String,
-    adminUsername: String,
-    adminPassword: String
-) throws
-```
-
-**Parameters:**
-- `targetUsername`: User to revoke token from
-- `targetPassword`: Target user's password
-- `adminUsername`: Admin user with secure token
-- `adminPassword`: Admin user's password
-
-**Throws:** `SecureTokenError` if the operation fails.
-
----
-
-## Commands
-
-The CLI tool provides the following commands:
-
-### interactive (default)
-
-Runs in interactive mode with guided prompts.
+Source the core without executing it by setting `ST_LIB_ONLY=1`:
 
 ```bash
-sudo securetoken
-sudo securetoken interactive
+ST_LIB_ONLY=1 . scripts/securetoken.sh
+truthy yes            # -> 1
+version_ge 14.0 10.13 # exit 0
+generate_password 20  # random 20-char password
 ```
 
-### create-user
+Key pure functions: `truthy`, `version_ge`, `json_escape`, `pick`,
+`generate_password`, `validate_username`, `validate_password`, `emit_result`.
+Platform functions (`token_status`, `user_exists`, `bootstrap_token_escrowed`,
+`create_user`, `grant_token`, …) call macOS binaries and only work on macOS.
 
-Creates a new user with a secure token.
+## Swift library
 
-```bash
-sudo securetoken create-user \
-    --username <username> \
-    --fullname <fullname> \
-    --admin-user <admin> \
-    [--password <password>] \
-    [--admin-password <password>] \
-    [--admin]
-```
+`SecureTokenManager` mirrors the shell behaviour for the optional CLI.
 
-### grant-token
+| Member | Description |
+|--------|-------------|
+| `init(logFile:)` | Construct; `stdinSecrets` / `preferBootstrap` are toggles. |
+| `isRoot()` / `supportsSecureToken()` / `isAppleSilicon()` / `bootIsAPFS()` | Platform probes. |
+| `mdmEnrolled()` / `bootstrapTokenEscrowed()` | MDM / Bootstrap Token detection. |
+| `userExists(_:)` / `hasSecureToken(_:)` / `localUsers()` / `tokenHolders()` | Directory queries. |
+| `validateUsername(_:)` / `validatePassword(_:)` | Throw `SecureTokenError` on invalid input. |
+| `generatePassword(length:)` | Strong password, ambiguous characters excluded. |
+| `resolveTokenMethod(adminUser:adminPassword:)` | Bootstrap vs admin decision. |
+| `createUser(...)` | Create an account via stdin-fed `sysadminctl`. |
+| `ensureToken(user:password:adminUser:adminPassword:)` | Idempotently grant + verify. |
 
-Grants a secure token to an existing user.
-
-```bash
-sudo securetoken grant-token \
-    --target-user <username> \
-    --admin-user <admin> \
-    [--target-password <password>] \
-    [--admin-password <password>]
-```
-
-### status
-
-Checks secure token status for a user.
-
-```bash
-sudo securetoken status --username <username>
-```
-
-### list-tokens
-
-Lists all users with secure tokens.
-
-```bash
-sudo securetoken list-tokens
-```
-
----
-
-## Error Types
-
-### SecureTokenError
-
-```swift
-enum SecureTokenError: Error {
-    case unsupportedSystem(String)
-    case insufficientPrivileges(String)
-    case noSecureToken(String)
-    case userCreationFailed(String)
-    case tokenGrantFailed(String)
-    case userAlreadyExists(String)
-    case validationError(String)
-    case commandFailed(String, Int32)
-}
-```
-
-| Error | Description |
-|-------|-------------|
-| `unsupportedSystem` | macOS version doesn't support secure tokens |
-| `insufficientPrivileges` | Not running with root/sudo |
-| `noSecureToken` | Admin user doesn't have a secure token |
-| `userCreationFailed` | Failed to create user account |
-| `tokenGrantFailed` | Failed to grant secure token |
-| `userAlreadyExists` | User account already exists |
-| `validationError` | Input validation failed |
-| `commandFailed` | System command returned non-zero exit code |
-
----
-
-## Shell Script API
-
-The shell script provides equivalent functionality through command-line arguments.
-
-### Arguments
-
-| Argument | Description |
-|----------|-------------|
-| `--new-user USERNAME` | Username for new account |
-| `--new-password PASSWORD` | Password for new account |
-| `--new-fullname NAME` | Full name for new account |
-| `--admin-user USERNAME` | Admin username |
-| `--admin-password PASSWORD` | Admin password |
-| `--make-admin` | Make user an administrator |
-| `--grant-only` | Only grant token, don't create user |
-| `--status USERNAME` | Check token status |
-| `--list-tokens` | List all users with tokens |
-| `--help` | Show help |
-| `--version` | Show version |
-
-### Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | General error |
-| 2 | Invalid arguments |
-| 3 | Insufficient privileges |
-| 4 | User already exists |
-| 5 | Token grant failed |
-
----
-
-## macOS System Commands Used
-
-The tool uses the following macOS system commands:
-
-### sysadminctl
-
-Used for user and token management:
-
-```bash
-# Check token status
-sysadminctl -secureTokenStatus <username>
-
-# Grant token
-sysadminctl -secureTokenOn <username> \
-    -password <user_password> \
-    -adminUser <admin> \
-    -adminPassword <admin_password>
-
-# Create user
-sysadminctl -addUser <username> \
-    -fullName <fullname> \
-    -password <password> \
-    -adminUser <admin> \
-    -adminPassword <admin_password>
-```
-
-### dscl
-
-Used for directory services queries:
-
-```bash
-# List users
-dscl . -list /Users
-
-# Check if user exists
-dscl . -read /Users/<username>
-```
-
----
-
-## Security Considerations
-
-1. **Password Handling**: Passwords are passed directly to system commands. For production use, consider using the Security framework for secure credential storage.
-
-2. **Logging**: Operations are logged to `/var/log/securetoken.log`. Ensure this file has appropriate permissions.
-
-3. **Root Privileges**: This tool requires root privileges. Always use `sudo` to execute.
-
-4. **Validation**: All inputs are validated before use. Invalid usernames or passwords will be rejected.
+`SecureTokenError` carries an `ExitStatus` whose `rawValue` matches the shell
+exit-code contract. `OperationResult.jsonLine(version:)` emits the same JSON
+shape as the shell core.

@@ -1,127 +1,161 @@
 # SecureToken
 
-A macOS application to automate secure token transfer to new user accounts without manual intervention.
+Automate macOS **Secure Token** provisioning for new user accounts — with **zero
+interactive prompts**, so it runs unattended from an **RMM** (NinjaOne, Datto,
+Kaseya, Addigy, Mosyle, …) or **Microsoft Intune**.
 
-## Overview
+The tool creates a local account (if needed) and ensures it holds a Secure
+Token. It **prefers the escrowed Bootstrap Token** — the credential-free path
+for MDM-managed Macs — and falls back to an existing Secure Token administrator
+only when no Bootstrap Token is available.
 
-Secure tokens are cryptographic keys used in macOS (10.13+) for FileVault disk encryption. When setting up new user accounts, they need to be granted a secure token to:
+## Why Secure Tokens (and Bootstrap Tokens) matter
 
-- Unlock FileVault-encrypted volumes at boot
-- Authenticate for certain system operations
-- Enable full disk encryption capabilities
+On APFS Macs (macOS 10.13+), a **Secure Token** is what lets a user unlock
+FileVault and authorise certain system operations. A new account created
+non-interactively often has **no** Secure Token, which breaks FileVault unlock
+for that user.
 
-This tool automates the process of creating a new user account and transferring/granting a secure token from an existing admin user.
+Historically, granting a token required typing an *existing* token-holder's
+credentials — impossible to do "without manually having to do anything." The
+modern answer is the **Bootstrap Token**: an MDM-escrowed key that lets macOS
+(10.15+, and required behaviour on Apple Silicon) grant Secure Tokens
+**without** any admin password. This tool is built around that path.
 
-## Requirements
-
-- macOS 10.13 (High Sierra) or later
-- Administrator privileges
-- An existing admin user with a secure token
-- System Integrity Protection (SIP) considerations for some operations
-
-## Installation
-
-### Using Swift Package Manager
-
-```bash
-cd SecureToken
-swift build -c release
-sudo cp .build/release/securetoken /usr/local/bin/
+```
+                 ┌─────────────────────────────┐
+                 │   run securetoken.sh (root)  │
+                 └──────────────┬──────────────┘
+                                │
+              Bootstrap Token escrowed to MDM?
+                    │yes                    │no
+                    ▼                       ▼
+        grant token via Bootstrap    use existing Secure Token
+        Token (NO credentials)       admin (ST_ADMIN_USER/PW)
+                    │                       │
+                    └───────────┬───────────┘
+                                ▼
+                    verify token ENABLED, exit 0
 ```
 
-### Using the Shell Script
+## What's in the box
+
+| Path | Purpose |
+|------|---------|
+| `scripts/securetoken.sh` | **Primary deliverable.** Self-contained, non-interactive core. Deploy this from any RMM or Intune. |
+| `scripts/intune/` | Intune portal steps + single-file config guidance. |
+| `scripts/rmm/` | RMM `ST_*` interface + NinjaOne wrapper. |
+| `scripts/secure-token-transfer.sh` | Deprecated v1 shim → forwards to the core. |
+| `Sources/SecureToken/` | Optional Swift CLI (same behaviour) for local/hands-on use. |
+| `tests/securetoken_test.sh` | Unit tests for the shell core (run on any OS). |
+| `docs/DEPLOYMENT.md` | Step-by-step for Intune, NinjaOne, generic RMM. |
+
+The shell core targets the **bash 3.2** that ships on every macOS and has **no
+dependencies** — ideal for RMM/Intune. The Swift CLI is an optional convenience
+you compile on macOS.
+
+## Quick start
+
+### Preflight (assess readiness — start here)
 
 ```bash
-chmod +x scripts/secure-token-transfer.sh
-sudo ./scripts/secure-token-transfer.sh
+sudo ST_ACTION=preflight ST_JSON=1 /bin/bash securetoken.sh
 ```
 
-## Usage
+Reports macOS version, MDM enrollment, whether a **Bootstrap Token is escrowed**,
+and which users already hold tokens.
 
-### Swift CLI Tool
+### From an RMM (Bootstrap Token, no passwords)
+
+Set script variables and run the core:
 
 ```bash
-# Interactive mode (recommended)
-sudo securetoken
-
-# Create user and grant secure token
-sudo securetoken create-user \
-    --username "newuser" \
-    --fullname "New User" \
-    --password "userpassword" \
-    --admin-user "existingadmin" \
-    --admin-password "adminpassword"
-
-# Grant secure token to existing user
-sudo securetoken grant-token \
-    --target-user "existinguser" \
-    --target-password "userpassword" \
-    --admin-user "adminwithtoken" \
-    --admin-password "adminpassword"
-
-# Check secure token status
-sudo securetoken status --username "anyuser"
-
-# List all users with secure tokens
-sudo securetoken list-tokens
+ST_ACTION=create-user
+ST_NEW_USER=itadmin
+ST_NEW_FULLNAME="IT Admin"
+ST_MAKE_ADMIN=1
+ST_GENERATE_PASSWORD=1     # returns a strong password in the JSON result
+ST_JSON=1
 ```
 
-### Shell Script
+See [`scripts/rmm/README.md`](scripts/rmm/README.md) and the NinjaOne wrapper.
+
+### From Intune
+
+Edit the `CONFIG` block at the top of `securetoken.sh`, upload the single file,
+and set it to run as **root**. See [`scripts/intune/README.md`](scripts/intune/README.md).
+
+### Fallback (no Bootstrap Token — supply an admin)
 
 ```bash
-# Interactive mode
-sudo ./scripts/secure-token-transfer.sh
-
-# With arguments
-sudo ./scripts/secure-token-transfer.sh \
-    --new-user "newuser" \
-    --new-password "password" \
-    --admin-user "admin" \
-    --admin-password "adminpass"
+sudo ST_NEW_USER=itadmin ST_NEW_PASSWORD='…' \
+     ST_ADMIN_USER=localadmin ST_ADMIN_PASSWORD='…' \
+     /bin/bash securetoken.sh create-user
 ```
 
-## How It Works
+## Configuration
 
-1. **Validates Prerequisites**: Checks that the current system supports secure tokens and that the admin user has a valid secure token.
+Every option is a CLI flag **and** an `ST_*` environment variable **and** a
+`CONFIG_*` line in the script's CONFIG block. Precedence: **flag → env → CONFIG
+block → default**.
 
-2. **Creates New User Account**: Uses `sysadminctl` to create a new local user account with the specified credentials.
+| Env var | Flag | Meaning |
+|---------|------|---------|
+| `ST_ACTION` | *(positional)* | `create-user` (default), `grant-token`, `status`, `list`, `preflight` |
+| `ST_NEW_USER` | `--new-user` | Username to create/target |
+| `ST_NEW_FULLNAME` | `--new-fullname` | Display name |
+| `ST_NEW_PASSWORD` | `--new-password` | Password |
+| `ST_GENERATE_PASSWORD` | `--generate-password` | Generate a strong password and return it |
+| `ST_MAKE_ADMIN` | `--make-admin` | Create an administrator |
+| `ST_HIDDEN` | `--hidden` | Hidden service account |
+| `ST_UID` | `--uid` | Explicit UID |
+| `ST_ADMIN_USER` | `--admin-user` | Existing Secure Token admin (fallback) |
+| `ST_ADMIN_PASSWORD` | `--admin-password` | That admin's password |
+| `ST_LOG_FILE` | `--log-file` | Log path (default `/var/log/securetoken.log`) |
+| `ST_JSON` | `--json` | Emit one JSON result line on stdout |
+| `ST_STDIN_SECRETS` | `--inline-secrets` (=0) | Feed passwords via stdin (default) vs inline |
+| `ST_PREFER_BOOTSTRAP` | `--no-bootstrap` (=0) | Use the Bootstrap Token when available (default) |
 
-3. **Grants Secure Token**: The admin user (who must have a secure token) grants a secure token to the new user via `sysadminctl -secureTokenOn`.
+## Exit codes (stable contract)
 
-4. **Verifies Transfer**: Confirms the new user now has a valid secure token.
+| Code | Meaning |
+|------|---------|
+| 0 | Success, or already in the desired state (idempotent — safe to re-run) |
+| 2 | Invalid arguments / configuration |
+| 10 | Not running as root |
+| 11 | macOS / platform unsupported |
+| 12 | Precondition failed (boot volume not APFS) |
+| 20 | User creation failed |
+| 21 | Secure Token grant failed |
+| 22 | No Bootstrap Token **and** no valid Secure Token admin |
+| 40 | Post-grant verification failed |
 
-## Security Considerations
+## Security model
 
-- **Passwords in Command Line**: For security, use interactive mode when possible to avoid passwords in shell history. The tool supports secure password input.
+- **No passwords in `ps`.** Passwords are streamed to `sysadminctl` over stdin
+  (`-` placeholders), not passed as arguments. (`--inline-secrets` disables this
+  only if a specific macOS build misbehaves.)
+- **Prefer credential-free.** The Bootstrap Token path needs no stored secrets
+  at all — the recommended posture.
+- **Secrets stay out of logs.** stdout carries only the optional JSON result;
+  human-readable progress goes to stderr and `/var/log/securetoken.log`. Neither
+  ever contains a password (except `generatedPassword` in the JSON result when
+  you explicitly ask the tool to generate one — treat that output as sensitive).
+- **Least privilege.** Supply admin credentials through your RMM's *secure*
+  custom fields, never inline in the policy body.
 
-- **Admin Credentials**: The admin password is required to grant secure tokens. Ensure this is handled securely.
+## Validation status
 
-- **Audit Logging**: All operations are logged to `/var/log/securetoken.log` for audit purposes.
-
-- **Keychain**: The tool can optionally create a keychain for the new user.
-
-## Troubleshooting
-
-### "Secure token is not supported on this system"
-- Ensure you're running macOS 10.13 or later
-- Check that your boot volume is APFS formatted
-
-### "Admin user does not have a secure token"
-- The admin user granting the token must have a secure token themselves
-- Check with: `sysadminctl -secureTokenStatus -adminUser <username>`
-
-### "Operation requires FileVault authentication"
-- Ensure the admin credentials are correct
-- The admin user must be a FileVault-enabled user
-
-## API Reference
-
-See [docs/API.md](docs/API.md) for detailed API documentation.
+- `scripts/securetoken.sh`, the NinjaOne wrapper, and the shim are **shellcheck
+  clean** and pass `bash -n`.
+- `tests/securetoken_test.sh` covers the core's pure logic (32 assertions) and
+  runs on any OS: `bash tests/securetoken_test.sh`.
+- The Swift CLI mirrors the shell behaviour but must be **built and tested on
+  macOS** (`swift build` / `swift test`); it is not compiled in CI on Linux.
+- End-to-end behaviour (actual `sysadminctl` token grants, Bootstrap Token use)
+  **must be validated on a test Mac** before fleet rollout — run `preflight`
+  first, then a single-device pilot.
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+MIT — see [LICENSE](LICENSE).
