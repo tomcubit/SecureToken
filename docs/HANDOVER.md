@@ -58,17 +58,20 @@ SecureToken/
 │       └── install-mocks.sh        ← installs the mock macOS command set (Linux only)
 ├── Sources/SecureToken/
 │   ├── SecureTokenCLI.swift        ← optional Swift CLI (@main lives here)
-│   └── SecureTokenManager.swift    ← Swift core, mirrors the shell behaviour
+│   └── SecureTokenManager.swift    ← Swift core (near-parity: no delete-user;
+│                                      adds an interactive mode the shell lacks)
 ├── Tests/SecureTokenTests/
 │   └── SecureTokenTests.swift      ← Swift unit tests (swift test, macOS)
 ├── docs/
 │   ├── HANDOVER.md                 ← this document
 │   ├── DEPLOYMENT.md               ← Intune / NinjaOne / generic-RMM deployment guide
 │   └── API.md                      ← actions, JSON contract, exit codes, library refs
-├── .github/workflows/ci.yml        ← 4 CI jobs (see §5)
+├── .github/workflows/ci.yml        ← 4 CI jobs (see §7)
 ├── Package.swift                   ← SwiftPM manifest (macOS 10.13 target)
 ├── README.md                       ← start here for concepts + config table
-└── CHANGELOG.md                    ← 3.1.0 / 3.0.0 / 2.0.0 history incl. bugs found
+├── CHANGELOG.md                    ← 3.1.0 / 3.0.0 / 2.0.0 history incl. bugs found
+├── LICENSE                         ← MIT
+└── .gitignore
 ```
 
 **The shell core is the supported RMM/Intune path.** The Swift CLI is an
@@ -87,14 +90,20 @@ optional local convenience and has never been exercised on a real Mac.
 | 10 | Not root |
 | 11 | Platform unsupported (not macOS / < 10.13 / preflight found blockers) |
 | 12 | Precondition failed (boot volume not APFS, no randomness) |
-| 20 | User creation failed (incl. "password did not authenticate after create") |
-| 21 | Token grant failed (incl. watchdog timeout, code 124 internally) |
-| 22 | No admin credentials **and** no Bootstrap Token first-login grant available |
+| 20 | User creation failed (incl. "password did not authenticate after create"; also a failed `delete-user`, and a watchdog timeout during the **create** call) |
+| 21 | Token grant failed (incl. a watchdog timeout during the **grant** call) |
+| 22 | No viable token source: admin credentials missing, wrong, for a non-existent admin, or for an admin without a token — and no Bootstrap Token first-login grant available |
 | 23 | Deferred grant while `ST_REQUIRE_IMMEDIATE_TOKEN=1` — **no account is created** |
 | 24 | Another instance already running (lock at `/var/run/securetoken.lock`) |
-| 40 | Post-grant verification failed (`sysadminctl` claimed success, token absent) |
+| 40 | Post-operation verification failed (`sysadminctl` claimed success but the token is absent; also: user still present after `delete-user`) |
 
-### JSON result (with `--json` / `ST_JSON=1`: exactly ONE line on stdout, nothing else)
+> Exit 12 also covers `mktemp` failure and a `dscl` enumeration failure during
+> `list`. One caveat for parsers: usage errors caught **before** configuration is
+> resolved — unknown option, a value-taking flag with no value, an invalid
+> `--secret-mode` — exit 2 with usage on **stderr and no JSON line**. Treat
+> "exit 2 + no JSON" as a configuration error in RMM logic.
+
+### JSON result (with `--json` / `ST_JSON=1`: one line on stdout — shown wrapped here)
 
 ```json
 {"tool":"securetoken","version":"3.1.0","status":"ok","exitCode":0,
@@ -177,7 +186,9 @@ sudo bash tests/integration_test.sh
 
 **Expected:** `RESULT: 66 passed, 0 failed`, exit 0, ~1 minute (two watchdog
 tests deliberately wait a few seconds each). The suite covers: every action;
-every exit code above; strict JSON parsing; idempotent re-runs; orphan
+exit codes 0, 2, 11, 12, 21, 22, 23, 24 and 40 (10 not-root and 20
+create-failed are exercised by the unit suite and the real-Mac pilot instead);
+strict JSON parsing; idempotent re-runs; orphan
 prevention (bad admin password / tokenless admin / `--require-immediate` all
 fail **before** an account exists); the silent-`sysadminctl`-lie → exit 40 path;
 watchdog kills of blocking prompts; rollback; generated-password recovery after
@@ -200,6 +211,10 @@ Open the repo's **Actions** tab for the latest run on this branch. Four jobs:
 **If the Swift job is red:** the shell deliverable is unaffected (it has no
 build step). Capture the compiler output into an issue; the Swift CLI must not
 be used until it is green.
+
+Note: the Linux CI job lints the two scripts and two of the test files; the
+Phase A command above shellchecks all **six** shell files — run it manually at
+least once rather than relying on CI alone.
 
 ---
 
@@ -345,9 +360,10 @@ the end-goal the token exists for.
 
 ### 9.5 Also worth probing on real macOS
 
-- `--secret-mode stdin` from an SSH session (has a TTY): should prompt; from a
-  `launchd`/RMM context it should time out at `ST_TIMEOUT` with exit 21 —
-  confirms the watchdog on real macOS.
+- `--secret-mode stdin` from an SSH session (has a TTY): should prompt. From a
+  `launchd`/RMM context it should time out at `ST_TIMEOUT` — use **`grant-token`**
+  for this probe and expect exit **21**; with `create-user` the timeout hits the
+  create call first and reports exit **20**. Either confirms the watchdog.
 - The `ps` window: while E2 runs, `ps aux | grep sysadminctl` from another
   shell — you should see the password briefly (documented `inline` trade-off).
   This is accepted behaviour, not a bug; note it for the security review.
