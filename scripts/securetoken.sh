@@ -92,7 +92,7 @@ CONFIG_TIMEOUT=""           # seconds per sysadminctl call (default 120)
 # NOTE: deliberately NOT 'readonly'. The documented library mode
 # (ST_LIB_ONLY=1 . securetoken.sh) and the test suite source this file more than
 # once per shell; on bash 3.2 re-assigning a readonly variable is a fatal error.
-ST_VERSION="3.0.0"
+ST_VERSION="3.1.0"
 
 # ---- Exit codes (stable contract for RMM/Intune result parsing) -----------
 EX_OK=0                # success, or already in desired state
@@ -153,6 +153,16 @@ truthy() {
 # username cannot forge extra log lines.
 sanitize_for_log() {
     printf '%s' "${1:-}" | tr -d '\000-\037'
+}
+
+# Trim LEADING/TRAILING whitespace (incl. CR) only — RMM consoles append it, but
+# interior whitespace must survive so an invalid value like "bad name" is
+# REJECTED by validation rather than silently rewritten to "badname".
+trim() {
+    local s="${1:-}"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
 }
 
 # ===========================================================================
@@ -885,6 +895,11 @@ do_create_user() {
     # password actually authenticates) BEFORE creating the account.
     require_token_preconditions
     resolve_token_plan
+    # ... and if the caller demands an immediate token, a deferred-only plan must
+    # fail HERE, before the account exists — not in grant_token afterwards.
+    if [ "$TOKEN_PLAN" = "deferred" ] && [ "$REQUIRE_IMMEDIATE" = "1" ]; then
+        die "$EX_TOKEN_DEFERRED" "No admin credentials supplied: the Secure Token could only be granted at first login, but ST_REQUIRE_IMMEDIATE_TOKEN=1 was set. No account was created."
+    fi
 
     create_user "$NEW_USER" "$NEW_FULLNAME" "$NEW_PASSWORD"
     grant_token "$NEW_USER" "$NEW_PASSWORD"
@@ -1018,12 +1033,13 @@ resolve_config() {
 
     JSON_MODE="$JSON"
 
-    # Trim stray whitespace/CR from RMM-injected string values.
-    ACTION=$(printf '%s' "$ACTION" | tr -d '\r\n\t ')
-    NEW_USER=$(printf '%s' "$NEW_USER" | tr -d '\r\n\t ')
-    ADMIN_USER=$(printf '%s' "$ADMIN_USER" | tr -d '\r\n\t ')
-    NEW_UID=$(printf '%s' "$NEW_UID" | tr -d '\r\n\t ')
-    SECRET_MODE=$(printf '%s' "$SECRET_MODE" | tr -d '\r\n\t ' | tr '[:upper:]' '[:lower:]')
+    # Trim stray LEADING/TRAILING whitespace/CR from RMM-injected values.
+    # (Interior whitespace is preserved so validation rejects it visibly.)
+    ACTION=$(trim "$ACTION")
+    NEW_USER=$(trim "$NEW_USER")
+    ADMIN_USER=$(trim "$ADMIN_USER")
+    NEW_UID=$(trim "$NEW_UID")
+    SECRET_MODE=$(trim "$SECRET_MODE" | tr '[:upper:]' '[:lower:]')
     SYS_TIMEOUT=$(printf '%s' "$SYS_TIMEOUT" | tr -cd '0-9')
     [ -n "$SYS_TIMEOUT" ] || SYS_TIMEOUT=120
 

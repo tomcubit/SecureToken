@@ -80,15 +80,17 @@ struct OperationResult {
 /// Manages Secure Token operations on macOS.
 final class SecureTokenManager {
 
-    static let version = "3.0.0"   // keep in lockstep with scripts/securetoken.sh
+    static let version = "3.1.0"   // keep in lockstep with scripts/securetoken.sh
 
     private let fileManager = FileManager.default
     private let logFile: String
-    /// When true, passwords are streamed to sysadminctl over stdin (using `-`
-    /// placeholders) so they never appear in the process table. Set false only
-    /// as a fallback if a specific macOS build misbehaves with stdin feeding.
-    var stdinSecrets: Bool = true
-    /// Prefer the escrowed Bootstrap Token when available (credential-free).
+    /// When true, `-` placeholders are passed so sysadminctl PROMPTS for each
+    /// secret — Apple's interactive option, which reads the controlling
+    /// terminal. It cannot work headless, so the default is false (inline
+    /// arguments, the path Apple documents for scripting).
+    var stdinSecrets: Bool = false
+    /// Allow the deferred first-login Bootstrap Token plan when no admin
+    /// credentials are supplied (macOS 11+, MDM-enrolled, token escrowed).
     var preferBootstrap: Bool = true
 
     init(logFile: String = "/var/log/securetoken.log") {
@@ -99,7 +101,9 @@ final class SecureTokenManager {
 
     /// Strip C0 control characters so a crafted value cannot forge log lines.
     private func sanitizeForLog(_ s: String) -> String {
-        return String(s.unicodeScalars.filter { $0.value >= 0x20 || $0 == "\u{09}" })
+        return String(s.unicodeScalars
+            .filter { $0.value >= 0x20 || $0 == "\u{09}" }
+            .map(Character.init))
     }
 
     /// True once the log path has been validated for this process.

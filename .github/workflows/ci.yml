@@ -33,6 +33,20 @@ jobs:
       - name: Unit tests
         run: bash tests/securetoken_test.sh
 
+  integration:
+    name: Shell — end-to-end against mock macOS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The mocks emulate sysadminctl/dscl/profiles/sw_vers/diskutil with
+      # Apple's documented Secure Token semantics (no credential-free grants,
+      # '-' passwords prompt-and-block). Runner is disposable, so installing
+      # into /usr/bin//usr/sbin is fine.
+      - name: Install mock macOS commands
+        run: sudo bash tests/mocks/install-mocks.sh
+      - name: End-to-end integration tests
+        run: sudo bash tests/integration_test.sh
+
   swift:
     name: Swift — build + test (macOS)
     runs-on: macos-latest

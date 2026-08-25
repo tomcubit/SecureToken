@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.1.0 — End-to-end test harness
+
+### Added
+- **Mock macOS command set** (`tests/mocks/install-mocks.sh`): faithful
+  emulations of `sysadminctl`, `dscl`, `profiles`, `sw_vers`, `diskutil` and
+  `createhomedir` that enforce Apple's documented Secure Token semantics —
+  including that `-secureTokenOn` without admin credentials does nothing (while
+  exiting 0), and that a `-` password blocks awaiting a terminal.
+- **Integration suite** (`tests/integration_test.sh`, 66 assertions): executes
+  the real `securetoken.sh` end-to-end against the mocks — every action, every
+  documented exit code, idempotency, orphan prevention, rollback, the watchdog
+  (both the hang case and headless `stdin` secret mode), locking, hidden-account
+  UIDs and strict JSON validity. Runs on Linux/CI; wired into the CI matrix.
+
+### Fixed (found by the new integration tests)
+- `resolve_config` stripped **all** whitespace from usernames, silently turning
+  an invalid `"bad name"` into a valid `badname` instead of rejecting it. Values
+  are now trimmed at the edges only (new `trim()` helper, unit-tested).
+- `--require-immediate` with a deferred-only plan failed **after** account
+  creation, leaving the orphan account the flag exists to prevent. The check now
+  runs before anything is created (exit 23, no account).
+- Swift: `String(UnicodeScalarView.filter(...))` in `sanitizeForLog` does not
+  compile; mapped through `Character` instead.
+
+---
+
 ## 3.0.0 — Corrected Secure Token architecture
 
 ### Fixed (critical)

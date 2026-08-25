@@ -169,15 +169,26 @@ block → default**.
 
 - `scripts/securetoken.sh`, the NinjaOne wrapper and the shim are **shellcheck
   clean** and pass `bash -n`.
-- `tests/securetoken_test.sh` — **69 assertions** covering the core's pure logic,
-  argument/config resolution, the JSON contract and secret scrubbing. Runs on any
-  OS: `bash tests/securetoken_test.sh`.
-- The **Swift CLI is not compiled in CI here** (Linux, no Swift toolchain). Build
-  and test it on macOS with `swift build` / `swift test` before relying on it.
-  The shell core is the supported RMM/Intune path.
-- **End-to-end behaviour must be validated on a test Mac** before fleet rollout:
-  real `sysadminctl` grants and Bootstrap Token behaviour cannot be exercised in
-  CI. Run `preflight`, then a single-device pilot — see the checklist in
+- **Unit tests** — `tests/securetoken_test.sh`, 75 assertions over the core's
+  pure logic, argument/config resolution, the JSON contract and secret
+  scrubbing. Runs on any OS: `bash tests/securetoken_test.sh`.
+- **End-to-end integration tests** — `tests/integration_test.sh`, 66 assertions
+  that execute the real script against a **mock macOS command set**
+  (`tests/mocks/`) which faithfully enforces Apple's Secure Token rules: no
+  credential-free `sysadminctl` grants, `-` passwords block awaiting a terminal,
+  `sysadminctl` exiting 0 on failure. Covers every action, every documented exit
+  code, idempotency, fail-fast/orphan prevention, rollback, the watchdog, the
+  lock and JSON validity. Linux + root only:
+  `sudo bash tests/mocks/install-mocks.sh && sudo bash tests/integration_test.sh`
+  (disposable machines only — it installs mock commands into `/usr/bin`).
+- **CI** (`.github/workflows/ci.yml`): shellcheck + both suites on Linux, the
+  unit suite under **real bash 3.2 on a macOS runner**, and `swift build` /
+  `swift test` on macOS. Check the repo's **Actions** tab for results — this
+  container has no Swift toolchain or macOS, so those two jobs are the compile
+  and 3.2-compatibility proof.
+- **A real-Mac pilot is still required** before fleet rollout: mocks encode
+  Apple's *documented* behaviour, not any given macOS build's quirks. Run
+  `preflight`, then a single-device pilot — see the checklist in
   [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## License
